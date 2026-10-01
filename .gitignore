@@ -1,0 +1,42 @@
+# Java / Maven
+target/
+*.class
+*.war
+*.ear
+hs_err_pid*
+replay_pid*
+
+# IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Logs
+logs/
+*.log
+
+# Local secrets
+.env
+.env.*
+!.env.example
+application-local.yml
+application-local.yaml
+*.key
+*.pem
+*.p12
+*.jks
+
+# Local runtime data
+mysql-data/
+redis-data/
+kafka-data/
+
+# Frontend dependencies
+node_modules/
+
+# Operating system
+.DS_Store
+Thumbs.db
+Desktop.ini
