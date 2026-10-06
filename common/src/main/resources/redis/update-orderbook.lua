@@ -7,6 +7,7 @@ KEYS:
 ARGV:
   1: seqId: 本次的SequenceId
   2: data: OrderBook快照的JSON数据
+  3: mode: 可选 restore，恢复结束允许相同序号刷新缓存，但不覆盖更高序号
 
 ]]--
 
@@ -19,7 +20,8 @@ local data = ARGV[2]
 local lastSeqId = redis.call('GET', KEY_LAST_SEQ)
 
 -- 如果sequenceId较新:
-if not lastSeqId or tonumber(seqId) > tonumber(lastSeqId) then
+if not lastSeqId or tonumber(seqId) > tonumber(lastSeqId)
+    or (ARGV[3] == 'restore' and tonumber(seqId) == tonumber(lastSeqId)) then
     -- 保存新的sequenceId:
     redis.call('SET', KEY_LAST_SEQ, seqId)
     -- 保存OrderBook的JSON:

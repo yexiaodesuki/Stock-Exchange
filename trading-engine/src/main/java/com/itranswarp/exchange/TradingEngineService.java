@@ -1,6 +1,6 @@
 /*
  * 交易引擎协调资产、订单、撮合与清算；历史重放复用状态逻辑，但隔离所有对外输出。
- * 当前仅提供重放入口，启动恢复、就绪门控和快照将在后续阶段接入。
+ * 启动恢复校验通过后才创建消费者和输出线程；一致性快照将在后续阶段接入。
  */
 package com.itranswarp.exchange;
 
@@ -16,7 +16,6 @@ import java.util.Map.Entry;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
-import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -70,7 +69,15 @@ public class TradingEngineService extends LoggerSupport {
     @Value("#{exchangeConfiguration.debugMode}")
     boolean debugMode = false;
 
-    boolean fatalError = false;
+    volatile boolean fatalError = false;
+
+    /** volatile 保证 HTTP 线程能看到恢复进度，不用等待耗时的恢复锁。 */
+    private volatile RecoveryState recoveryState = RecoveryState.RECOVERING;
+
+    private boolean recoveryStarted;
+
+    /** 就绪描述的是恢复已完成且实时入口已启动，不替代 Kafka 或 Redis 持续健康监测。 */
+    public enum RecoveryState { RECOVERING, READY, FAILED, STOPPED }
 
     @Autowired
     AssetService assetService;
@@ -109,18 +116,34 @@ public class TradingEngineService extends LoggerSupport {
     private Thread orderBookThread;
     private Thread dbThread;
 
-    private OrderBookBean latestOrderBook = null;
+    private volatile OrderBookBean latestOrderBook = null;
     private Queue<List<OrderEntity>> orderQueue = new ConcurrentLinkedQueue<>();
     private Queue<List<MatchDetailEntity>> matchQueue = new ConcurrentLinkedQueue<>();
     private Queue<TickMessage> tickQueue = new ConcurrentLinkedQueue<>();
     private Queue<ApiResultMessage> apiResultQueue = new ConcurrentLinkedQueue<>();
     private Queue<NotificationMessage> notificationQueue = new ConcurrentLinkedQueue<>();
 
-    @PostConstruct
-    public void init() {
+    /** 只允许新引擎开始一次恢复，不允许在线清空或覆盖已经处理的状态。 */
+    public synchronized void beginRecovery() {
+        if (recoveryState != RecoveryState.RECOVERING || recoveryStarted || fatalError || lastSequenceId != 0) {
+            throw new IllegalStateException("引擎不是可恢复的新状态");
+        }
+        this.recoveryStarted = true;
+    }
+
+    /** 恢复后发布一次当前盘口，再启动实时消费；任意初始化失败由恢复协调器清理。 */
+    public synchronized void startAfterRecovery() {
+        if (recoveryState != RecoveryState.RECOVERING || !recoveryStarted || fatalError) {
+            throw new IllegalStateException("不能开放未成功恢复的引擎");
+        }
         this.shaUpdateOrderBookLua = this.redisService.loadScriptFromClassPath("/redis/update-orderbook.lua");
-        this.consumer = this.messagingFactory.createBatchMessageListener(Messaging.Topic.TRADE, IpUtil.getHostId(),
-                this::processMessages);
+        OrderBookBean book = currentOrderBook();
+        Boolean published = this.redisService.executeScriptReturnBoolean(this.shaUpdateOrderBookLua,
+                new String[] { RedisCache.Key.ORDER_BOOK },
+                new String[] { String.valueOf(book.sequenceId), JsonUtil.writeJson(book), "restore" });
+        if (!Boolean.TRUE.equals(published)) {
+            throw new IllegalStateException("Redis 盘口位置领先于恢复位置，拒绝开放可能过期的引擎");
+        }
         this.producer = this.messagingFactory.createMessageProducer(Topic.TICK, TickMessage.class);
         this.tickThread = new Thread(this::runTickThread, "async-tick");
         this.tickThread.start();
@@ -132,18 +155,66 @@ public class TradingEngineService extends LoggerSupport {
         this.apiResultThread.start();
         this.dbThread = new Thread(this::runDbThread, "async-db");
         this.dbThread.start();
+        // earliest 只用于没有有效消费位置时；启动窗口内的新事件不能从 latest 开始而被跳过。
+        this.consumer = this.messagingFactory.createBatchMessageListener(Messaging.Topic.TRADE, IpUtil.getHostId(),
+                this::onTradeMessages, null, "earliest");
+        this.recoveryState = RecoveryState.READY;
     }
 
+    /** 查询可见的生命周期状态；致命错误即使尚未清理线程也不得报告就绪。 */
+    public RecoveryState getRecoveryState() {
+        return fatalError ? RecoveryState.FAILED : recoveryState;
+    }
+
+    /** 业务入口快速拒绝恢复中、失败或停止状态，不返回半恢复的空资产。 */
+    public void requireReady() {
+        RecoveryState state = getRecoveryState();
+        if (state != RecoveryState.READY) {
+            throw new ApiException(ApiError.ENGINE_UNAVAILABLE, state.name(), "交易引擎尚未就绪，请稍后重试");
+        }
+    }
+
+    /** 恢复失败后关闭已创建的资源；不回滚已应用的内存事件，必须重建引擎再恢复。 */
+    public void failRecovery() {
+        this.fatalError = true;
+        this.recoveryState = RecoveryState.FAILED;
+        stopResources();
+    }
+
+    /** 关闭业务入口和所有输出线程，兼容恢复尚未创建消费者时的清理。 */
     @PreDestroy
     public void destroy() {
-        this.consumer.stop();
-        this.orderBookThread.interrupt();
-        this.dbThread.interrupt();
+        this.recoveryState = RecoveryState.STOPPED;
+        stopResources();
     }
 
+    /** 逐个清理已创建的资源，避免某个资源关闭失败阻止其余线程收到退出信号。 */
+    private void stopResources() {
+        if (this.consumer != null) {
+            try {
+                this.consumer.stop();
+            } catch (Exception e) {
+                logger.warn("停止交易消费者失败", e);
+            }
+        }
+        for (Thread thread : new Thread[] { tickThread, notifyThread, apiResultThread, orderBookThread, dbThread }) {
+            if (thread != null) {
+                thread.interrupt();
+            }
+        }
+    }
+
+    /** 盘口发布位置使用引擎已应用序号，使撤单也能推进 Redis 版本而不是沿用最后下单序号。 */
+    private OrderBookBean currentOrderBook() {
+        OrderBookBean book = this.matchEngine.getOrderBook(this.orderBookDepth);
+        book.sequenceId = this.lastSequenceId;
+        return book;
+    }
+
+    /** 从实时输出队列发送 Tick；收到关闭信号即停止，不负责历史行情补偿。 */
     private void runTickThread() {
         logger.info("start tick thread...");
-        for (;;) {
+        while (!Thread.currentThread().isInterrupted()) {
             List<TickMessage> msgs = new ArrayList<>();
             for (;;) {
                 TickMessage msg = tickQueue.poll();
@@ -173,9 +244,10 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
+    /** 发布实时私人通知，恢复期间不会生成这些任务。 */
     private void runNotifyThread() {
         logger.info("start publish notify to redis...");
-        for (;;) {
+        while (!Thread.currentThread().isInterrupted()) {
             NotificationMessage msg = this.notificationQueue.poll();
             if (msg != null) {
                 redisService.publish(RedisCache.Topic.NOTIFICATION, JsonUtil.writeJson(msg));
@@ -191,9 +263,10 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
+    /** 发布实时异步请求结果，线程关闭时不再接收新输出。 */
     private void runApiResultThread() {
         logger.info("start publish api result to redis...");
-        for (;;) {
+        while (!Thread.currentThread().isInterrupted()) {
             ApiResultMessage result = this.apiResultQueue.poll();
             if (result != null) {
                 redisService.publish(RedisCache.Topic.TRADING_API_RESULT, JsonUtil.writeJson(result));
@@ -209,10 +282,11 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
+    /** 发布已完成事件边界上的最新盘口；以 volatile 引用保证跨线程可见性。 */
     private void runOrderBookThread() {
         logger.info("start update orderbook snapshot to redis...");
         long lastSequenceId = 0;
-        for (;;) {
+        while (!Thread.currentThread().isInterrupted()) {
             // 获取OrderBookBean的引用，确保后续操作针对局部变量而非成员变量:
             final OrderBookBean orderBook = this.latestOrderBook;
             // 仅在OrderBookBean更新后刷新Redis:
@@ -238,9 +312,10 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
+    /** 消费实时历史投影任务；关闭时退出，持久化输出可靠性不在本阶段补偿。 */
     private void runDbThread() {
         logger.info("start batch insert to db...");
-        for (;;) {
+        while (!Thread.currentThread().isInterrupted()) {
             try {
                 saveToDb();
             } catch (InterruptedException e) {
@@ -295,6 +370,12 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
+    /** Kafka 回调在初始化锁释放后检查就绪，再接入实时处理，禁止恢复期间修改状态。 */
+    private synchronized void onTradeMessages(List<AbstractEvent> messages) {
+        requireReady();
+        processMessages(messages);
+    }
+
     /** 串行执行实时批次，并仅为实时事件生成供 Redis 输出线程使用的盘口快照。 */
     public synchronized void processMessages(List<AbstractEvent> messages) {
         this.orderBookChanged = false;
@@ -303,7 +384,7 @@ public class TradingEngineService extends LoggerSupport {
         }
         if (this.orderBookChanged) {
             // 获取最新的OrderBook快照:
-            this.latestOrderBook = this.matchEngine.getOrderBook(this.orderBookDepth);
+            this.latestOrderBook = currentOrderBook();
         }
     }
 

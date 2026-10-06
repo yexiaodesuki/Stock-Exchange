@@ -1,6 +1,8 @@
+/* 引擎 HTTP 代理：查询与写入前检查就绪，并将恢复中或不可达错误映射为 503。 */
 package com.itranswarp.exchange.service;
 
 import java.io.IOException;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import org.springframework.beans.factory.annotation.Value;
@@ -8,6 +10,7 @@ import org.springframework.stereotype.Component;
 
 import com.itranswarp.exchange.ApiError;
 import com.itranswarp.exchange.ApiException;
+import com.itranswarp.exchange.util.JsonUtil;
 import com.itranswarp.exchange.support.LoggerSupport;
 import okhttp3.ConnectionPool;
 import okhttp3.OkHttpClient;
@@ -34,10 +37,26 @@ public class TradingEngineApiProxyService extends LoggerSupport {
             // do not retry:
             .retryOnConnectionFailure(false).build();
 
+    /** 查询引擎就绪状态；失败时禁止创建异步交易请求，不向定序 Topic 发送事件。 */
+    public void requireReady() {
+        try {
+            Map<?, ?> status = JsonUtil.readJson(get("/internal/status"), Map.class);
+            if (!Boolean.TRUE.equals(status.get("ready"))) {
+                throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎尚未就绪");
+            }
+        } catch (IOException | RuntimeException e) {
+            throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎未就绪或探针失败，请稍后重试");
+        }
+    }
+
+    /** 转发查询；引擎 503 或连接失败均明确不可用，其余非成功状态保持原业务错误处理。 */
     public String get(String url) throws IOException {
         Request request = new Request.Builder().url(tradingEngineInternalApiEndpoint + url).header("Accept", "*/*")
                 .build();
         try (Response response = okhttpClient.newCall(request).execute()) {
+            if (response.code() == 503) {
+                throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎尚未就绪，请稍后重试");
+            }
             if (response.code() != 200) {
                 logger.error("Internal api failed with code {}: {}", Integer.valueOf(response.code()), url);
                 throw new ApiException(ApiError.OPERATION_TIMEOUT, null, "operation timeout.");
@@ -50,6 +69,8 @@ public class TradingEngineApiProxyService extends LoggerSupport {
                 }
                 return json;
             }
+        } catch (IOException e) {
+            throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎不可达，请稍后重试");
         }
     }
 }

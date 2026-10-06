@@ -1,9 +1,11 @@
+/* Kafka 消息工厂：通常沿用公共配置，引擎恢复衔接可单独指定消费位置重置策略。 */
 package com.itranswarp.exchange.messaging;
 
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Set;
+import java.util.Properties;
 import java.util.concurrent.ExecutionException;
 import java.util.regex.Pattern;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -80,13 +82,21 @@ public class MessagingFactory extends LoggerSupport {
         };
     }
 
+    /** 按默认错误处理与消费策略创建并启动批量消费者。 */
     public <T extends AbstractMessage> MessageConsumer createBatchMessageListener(Messaging.Topic topic, String groupId,
             BatchMessageHandler<T> messageHandler) {
         return createBatchMessageListener(topic, groupId, messageHandler, null);
     }
 
+    /** 保留原调用方式，不改变其他服务的消费策略。 */
     public <T extends AbstractMessage> MessageConsumer createBatchMessageListener(Messaging.Topic topic, String groupId,
             BatchMessageHandler<T> messageHandler, CommonErrorHandler errorHandler) {
+        return createBatchMessageListener(topic, groupId, messageHandler, errorHandler, null);
+    }
+
+    /** 创建批量消费者；可选重置策略只影响没有有效已提交位置的情况，不重置已有消费位置。 */
+    public <T extends AbstractMessage> MessageConsumer createBatchMessageListener(Messaging.Topic topic, String groupId,
+            BatchMessageHandler<T> messageHandler, CommonErrorHandler errorHandler, String autoOffsetReset) {
         logger.info("try create batch message listener for topic {}: group id = {}...", topic, groupId);
         ConcurrentMessageListenerContainer<String, String> listenerContainer = listenerContainerFactory
                 .createListenerContainer(new KafkaListenerEndpointAdapter() {
@@ -114,6 +124,11 @@ public class MessagingFactory extends LoggerSupport {
         });
         if (errorHandler != null) {
             listenerContainer.setCommonErrorHandler(errorHandler);
+        }
+        if (autoOffsetReset != null) {
+            Properties overrides = new Properties();
+            overrides.setProperty("auto.offset.reset", autoOffsetReset);
+            listenerContainer.getContainerProperties().setKafkaConsumerProperties(overrides);
         }
         listenerContainer.start();
         return listenerContainer::stop;

@@ -1,3 +1,4 @@
+/* 浏览器 API 代理：保留引擎未就绪的 503 错误，避免向页面返回伪正常状态。 */
 package com.itranswarp.exchange.ui.web;
 
 import java.io.BufferedReader;
@@ -119,9 +120,10 @@ public class ProxyFilterRegistrationBean extends FilterRegistrationBean<Filter> 
             return map;
         }
 
+        /** 将上游业务错误写回浏览器，恢复中使用 503，其余业务拒绝保持 400。 */
         private void writeApiException(HttpServletRequest request, HttpServletResponse response, ApiException e)
                 throws IOException {
-            response.setStatus(400);
+            response.setStatus(e.error.error() == ApiError.ENGINE_UNAVAILABLE ? 503 : 400);
             response.setContentType("application/json;charset=utf-8");
             PrintWriter pw = response.getWriter();
             pw.write(objectMapper.writeValueAsString(e.error));

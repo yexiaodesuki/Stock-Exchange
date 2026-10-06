@@ -1,3 +1,4 @@
+/* 交易与行情 HTTP 入口：引擎状态查询和交易依赖就绪门控，历史行情仍由原服务负责。 */
 package com.itranswarp.exchange.web.api;
 
 import java.io.IOException;
@@ -104,9 +105,11 @@ public class TradingApiController extends AbstractApiController {
         return tradingEngineApiProxyService.get("/internal/" + UserContext.getRequiredUserId() + "/orders");
     }
 
+    /** 先确认引擎恢复完成，避免将恢复前残留的 Redis 盘口当成当前可交易状态。 */
     @ResponseBody
     @GetMapping(value = "/orderBook", produces = "application/json")
     public String getOrderBook() {
+        tradingEngineApiProxyService.requireReady();
         String data = redisService.get(RedisCache.Key.ORDER_BOOK);
         return data == null ? OrderBookBean.EMPTY : data;
     }
@@ -194,11 +197,7 @@ public class TradingApiController extends AbstractApiController {
         return this.historyService.getHistoryMatchDetails(orderId);
     }
 
-    /**
-     * Cancel an order.
-     *
-     * @param orderId The order id.
-     */
+    /** 撤单前检查归属与就绪；若发送失败，移除异步等待项，防止留下无响应请求。 */
     @PostMapping(value = "/orders/{orderId}/cancel", produces = "application/json")
     @ResponseBody
     public DeferredResult<ResponseEntity<String>> cancelOrder(@PathVariable("orderId") Long orderId) throws Exception {
@@ -222,19 +221,23 @@ public class TradingApiController extends AbstractApiController {
         // track deferred:
         this.deferredResultMap.put(refId, deferred);
         logger.info("cancel order message created: {}", message);
-        this.sendEventService.sendMessage(message);
+        try {
+            this.sendEventService.sendMessage(message);
+        } catch (RuntimeException e) {
+            this.deferredResultMap.remove(refId);
+            throw e;
+        }
         return deferred;
     }
 
-    /**
-     * Create a new order.
-     */
+    /** 下单前检查引擎就绪；发送失败清理异步等待项，不让恢复中请求进入定序系统。 */
     @PostMapping(value = "/orders", produces = "application/json")
     @ResponseBody
     public DeferredResult<ResponseEntity<String>> createOrder(@RequestBody OrderRequestBean orderRequest)
             throws IOException {
         final Long userId = UserContext.getRequiredUserId();
         orderRequest.validate();
+        tradingEngineApiProxyService.requireReady();
         final String refId = IdUtil.generateUniqueId();
         var event = new OrderRequestEvent();
         event.refId = refId;
@@ -252,7 +255,12 @@ public class TradingApiController extends AbstractApiController {
         });
         // track deferred:
         this.deferredResultMap.put(event.refId, deferred);
-        this.sendEventService.sendMessage(event);
+        try {
+            this.sendEventService.sendMessage(event);
+        } catch (RuntimeException e) {
+            this.deferredResultMap.remove(event.refId);
+            throw e;
+        }
         return deferred;
     }
 
