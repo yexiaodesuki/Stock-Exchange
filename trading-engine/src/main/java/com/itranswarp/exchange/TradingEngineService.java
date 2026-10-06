@@ -1,3 +1,7 @@
+/*
+ * 交易引擎协调资产、订单、撮合与清算；历史重放复用状态逻辑，但隔离所有对外输出。
+ * 当前仅提供重放入口，启动恢复、就绪门控和快照将在后续阶段接入。
+ */
 package com.itranswarp.exchange;
 
 import java.math.BigDecimal;
@@ -291,7 +295,8 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
-    public void processMessages(List<AbstractEvent> messages) {
+    /** 串行执行实时批次，并仅为实时事件生成供 Redis 输出线程使用的盘口快照。 */
+    public synchronized void processMessages(List<AbstractEvent> messages) {
         this.orderBookChanged = false;
         for (AbstractEvent message : messages) {
             processEvent(message);
@@ -302,13 +307,44 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
-    public void processEvent(AbstractEvent event) {
+    /** 执行一个实时事件，保留现有缺口补读和异步输出行为。 */
+    public synchronized void processEvent(AbstractEvent event) {
+        executeEvent(event, EventExecutionMode.LIVE);
+    }
+
+    /**
+     * 按输入顺序重放已定序的历史事件，仅重建状态和已应用序号。
+     * 不访问数据库补读，不生成旧通知、行情、HTTP 结果或历史写入任务。
+     * 与实时入口使用同一锁；断链或执行失败会标记引擎失败并抛异常，调用者不得继续开放服务。
+     * 此方法不清空既有状态，也不保证整批回滚，应由后续恢复协调器在新状态上调用。
+     */
+    public synchronized void replayEvents(List<AbstractEvent> events) {
+        if (this.fatalError) {
+            throw new IllegalStateException("交易引擎已失败，不能继续重放");
+        }
+        for (AbstractEvent event : events) {
+            executeEvent(event, EventExecutionMode.REPLAY);
+        }
+    }
+
+    /** 返回已完整执行的事件序号；该值不是 Kafka 消费位置或数据库最大序号。 */
+    public synchronized long getLastSequenceId() {
+        return this.lastSequenceId;
+    }
+
+    /** 共用事件顺序检查与状态分发，执行模式只控制输出和重放失败行为。 */
+    private void executeEvent(AbstractEvent event, EventExecutionMode mode) {
         if (this.fatalError) {
             return;
         }
         if (event.sequenceId <= this.lastSequenceId) {
             logger.warn("skip duplicate event: {}", event);
             return;
+        }
+        if (mode == EventExecutionMode.REPLAY && event.previousId != this.lastSequenceId) {
+            this.fatalError = true;
+            throw new IllegalStateException("历史事件断链：期望 previousId=" + this.lastSequenceId
+                    + "，实际 previousId=" + event.previousId);
         }
         if (event.previousId > this.lastSequenceId) {
             logger.warn("event lost: expected previous id {} but actual {} for event {}", this.lastSequenceId,
@@ -320,7 +356,7 @@ public class TradingEngineService extends LoggerSupport {
                 return;
             }
             for (AbstractEvent e : events) {
-                this.processEvent(e);
+                executeEvent(e, mode);
             }
             return;
         }
@@ -335,17 +371,27 @@ public class TradingEngineService extends LoggerSupport {
         }
         try {
             if (event instanceof OrderRequestEvent) {
-                createOrder((OrderRequestEvent) event);
+                createOrder((OrderRequestEvent) event, mode);
             } else if (event instanceof OrderCancelEvent) {
-                cancelOrder((OrderCancelEvent) event);
+                cancelOrder((OrderCancelEvent) event, mode);
             } else if (event instanceof TransferEvent) {
                 transfer((TransferEvent) event);
             } else {
+                if (mode == EventExecutionMode.REPLAY) {
+                    throw new IllegalArgumentException("不支持的历史事件类型：" + event.getClass().getName());
+                }
                 logger.error("unable to process event type: {}", event.getClass().getName());
                 panic();
                 return;
             }
+            if (debugMode) {
+                this.validate();
+            }
         } catch (Exception e) {
+            if (mode == EventExecutionMode.REPLAY) {
+                this.fatalError = true;
+                throw new IllegalStateException("历史事件执行失败，sequenceId=" + event.sequenceId, e);
+            }
             logger.error("process event error.", e);
             panic();
             return;
@@ -355,7 +401,6 @@ public class TradingEngineService extends LoggerSupport {
             logger.debug("set last processed sequence id: {}...", this.lastSequenceId);
         }
         if (debugMode) {
-            this.validate();
             this.debug();
         }
     }
@@ -372,7 +417,8 @@ public class TradingEngineService extends LoggerSupport {
         return ok;
     }
 
-    void createOrder(OrderRequestEvent event) {
+    /** 共用下单、冻结、撮合和清算；重放完成状态变更后立即返回，不创建输出任务。 */
+    private void createOrder(OrderRequestEvent event, EventExecutionMode mode) {
         ZonedDateTime zdt = Instant.ofEpochMilli(event.createdAt).atZone(zoneId);
         int year = zdt.getYear();
         int month = zdt.getMonth().getValue();
@@ -382,11 +428,21 @@ public class TradingEngineService extends LoggerSupport {
         if (order == null) {
             logger.warn("create order failed.");
             // 推送失败结果:
-            this.apiResultQueue.add(ApiResultMessage.createOrderFailed(event.refId, event.createdAt));
+            if (mode == EventExecutionMode.LIVE) {
+                this.apiResultQueue.add(ApiResultMessage.createOrderFailed(event.refId, event.createdAt));
+            }
             return;
         }
         MatchResult result = this.matchEngine.processOrder(event.sequenceId, order);
         this.clearingService.clearMatchResult(result);
+        if (mode == EventExecutionMode.REPLAY) {
+            return;
+        }
+        publishOrderResult(event, order, result);
+    }
+
+    /** 为实时订单收集 HTTP 结果、成交通知、Tick 和历史投影；重放不进入此方法。 */
+    private void publishOrderResult(OrderRequestEvent event, OrderEntity order, MatchResult result) {
         // 推送成功结果,注意必须复制一份OrderEntity,因为将异步序列化:
         this.apiResultQueue.add(ApiResultMessage.orderSuccess(event.refId, order.copy(), event.createdAt));
         this.orderBookChanged = true;
@@ -462,16 +518,22 @@ public class TradingEngineService extends LoggerSupport {
         return d;
     }
 
-    void cancelOrder(OrderCancelEvent event) {
+    /** 共用撤单和解冻逻辑；重放不产生成功或失败响应，也不触发盘口发布。 */
+    private void cancelOrder(OrderCancelEvent event, EventExecutionMode mode) {
         OrderEntity order = this.orderService.getOrder(event.refOrderId);
         // 未找到活动订单或订单不属于该用户:
         if (order == null || order.userId.longValue() != event.userId.longValue()) {
             // 发送失败消息:
-            this.apiResultQueue.add(ApiResultMessage.cancelOrderFailed(event.refId, event.createdAt));
+            if (mode == EventExecutionMode.LIVE) {
+                this.apiResultQueue.add(ApiResultMessage.cancelOrderFailed(event.refId, event.createdAt));
+            }
             return;
         }
         this.matchEngine.cancel(event.createdAt, order);
         this.clearingService.clearCancelOrder(order);
+        if (mode == EventExecutionMode.REPLAY) {
+            return;
+        }
         this.orderBookChanged = true;
         // 发送成功消息:
         this.apiResultQueue.add(ApiResultMessage.orderSuccess(event.refId, order, event.createdAt));
@@ -602,10 +664,11 @@ public class TradingEngineService extends LoggerSupport {
         require(copyOfActiveOrders.isEmpty(), "Not all active orders are in order book.");
     }
 
+    /** 校验失败抛出异常，由事件入口决定实时停机或重放失败，不在校验内部退出进程。 */
     void require(boolean condition, String errorMessage) {
         if (!condition) {
             logger.error("validate failed: {}", errorMessage);
-            panic();
+            throw new IllegalStateException("交易状态校验失败：" + errorMessage);
         }
     }
 }
