@@ -42,6 +42,7 @@ import com.itranswarp.exchange.order.OrderService;
 import com.itranswarp.exchange.redis.RedisConfiguration;
 import com.itranswarp.exchange.redis.RedisService;
 import com.itranswarp.exchange.store.StoreService;
+import com.itranswarp.exchange.snapshot.SnapshotService;
 import com.itranswarp.exchange.util.JsonUtil;
 import com.itranswarp.exchange.web.api.InternalTradingEngineApiController;
 
@@ -366,7 +367,19 @@ class EngineRecoveryTest {
 
         /** 调用与生产 ApplicationRunner 完全相同的恢复入口。 */
         void recover() {
-            new EngineRecoveryService(engine, store).run(null);
+            // 第二阶段用例保持无快照前提；真实快照路径由第三阶段专用用例验证。
+            SnapshotService snapshots = new SnapshotService(engine, null) {
+                /** 本组测试不提供快照，验证原全量事件恢复行为。 */
+                @Override
+                public void restoreLatest(long target) { }
+                /** 本组测试不写数据库，快照持久化由专用测试验证。 */
+                @Override
+                public void saveRecoveredState() { }
+                /** 本组测试不创建周期任务，专注消费者及输出线程生命周期。 */
+                @Override
+                public void startPeriodic() { }
+            };
+            new EngineRecoveryService(engine, store, snapshots).run(null);
         }
 
         /** 等待所有已创建线程退出，显式发现启动失败或停机产生的线程泄漏。 */

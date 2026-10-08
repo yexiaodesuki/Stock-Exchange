@@ -1,6 +1,6 @@
 /*
- * 启动时从完整的 MySQL 事件历史恢复引擎，校验成功后才启动实时消费并开放业务。
- * 本阶段不使用快照；要求单引擎运行，事件历史不能被裁剪。
+ * 启动时从有效快照与 MySQL 增量事件恢复引擎，校验并保存快照后才开放业务。
+ * 无有效快照时全量重放；要求单引擎运行，本阶段不裁剪事件历史。
  */
 package com.itranswarp.exchange;
 
@@ -12,6 +12,7 @@ import org.springframework.stereotype.Component;
 
 import com.itranswarp.exchange.message.event.AbstractEvent;
 import com.itranswarp.exchange.store.StoreService;
+import com.itranswarp.exchange.snapshot.SnapshotService;
 import com.itranswarp.exchange.support.LoggerSupport;
 
 @Component
@@ -20,11 +21,13 @@ public class EngineRecoveryService extends LoggerSupport implements ApplicationR
     private static final int PAGE_SIZE = 1000;
     private final TradingEngineService engine;
     private final StoreService store;
+    private final SnapshotService snapshots;
 
-    /** 注入引擎和事件仓储；构造时不启动消费，允许 Web 查询先看到恢复中状态。 */
-    public EngineRecoveryService(TradingEngineService engine, StoreService store) {
+    /** 注入引擎、事件与快照服务；构造时不启动消费，允许 Web 查询先看到恢复中状态。 */
+    public EngineRecoveryService(TradingEngineService engine, StoreService store, SnapshotService snapshots) {
         this.engine = engine;
         this.store = store;
+        this.snapshots = snapshots;
     }
 
     /** Spring 启动完成后执行有限上界重放；失败向启动流程抛出，不开放半恢复状态。 */
@@ -33,6 +36,7 @@ public class EngineRecoveryService extends LoggerSupport implements ApplicationR
         try {
             engine.beginRecovery();
             long target = store.getLatestEventSequenceId();
+            snapshots.restoreLatest(target);
             logger.info("开始恢复交易引擎，历史上界={}", target);
             while (engine.getLastSequenceId() < target) {
                 long previous = engine.getLastSequenceId();
@@ -46,9 +50,12 @@ public class EngineRecoveryService extends LoggerSupport implements ApplicationR
                 }
             }
             engine.validate();
+            snapshots.saveRecoveredState();
             engine.startAfterRecovery();
+            snapshots.startPeriodic();
             logger.info("交易引擎恢复完成，已应用序号={}", engine.getLastSequenceId());
         } catch (Exception e) {
+            snapshots.stop();
             engine.failRecovery();
             throw new IllegalStateException("交易引擎恢复失败，禁止开放业务", e);
         }

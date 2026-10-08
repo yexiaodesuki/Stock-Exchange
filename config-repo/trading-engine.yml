@@ -1,4 +1,9 @@
-# trading-engine configuration
+# 交易引擎配置：启动恢复依赖快照增量迁移，定期快照仅在事件进度变化时保存。
 
 server:
   port: ${APP_PORT:8002}
+
+exchange:
+  snapshot:
+    # 检查间隔（毫秒）；不是每个事件写一次，单实例运行且暂不自动删除历史。
+    interval-ms: ${ENGINE_SNAPSHOT_INTERVAL_MS:60000}

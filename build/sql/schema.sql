@@ -1,4 +1,6 @@
--- init exchange database
+-- 全新开发环境初始化：一次创建全部业务表与交易引擎快照表。
+-- 注意：本脚本会删除并重建 exchange 数据库，仅用于明确授权的全新安装或开发环境重置。
+-- 日常启动保留现有数据库，不重新执行本脚本；快照内容由引擎生成，不在 SQL 中插入。
 
 DROP DATABASE IF EXISTS exchange;
 
@@ -53,6 +55,19 @@ CREATE TABLE events (
   CONSTRAINT UNI_PREV_ID UNIQUE (previousId),
   PRIMARY KEY(sequenceId)
 ) CHARACTER SET utf8 COLLATE utf8_general_ci AUTO_INCREMENT = 1000;
+
+
+-- 快照表随业务表一次创建：引擎首次启动先持久化一致状态，再开放业务。
+CREATE TABLE engine_snapshots (
+    id BIGINT NOT NULL AUTO_INCREMENT COMMENT '快照记录标识',
+    sequenceId BIGINT NOT NULL COMMENT '最后完整应用的事件序号，不是数据库最大序号',
+    formatVersion INT NOT NULL COMMENT '快照格式版本',
+    snapshotData LONGTEXT NOT NULL COMMENT '完整状态的原始JSON文本，金额按十进制保存',
+    checksum CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT '原始UTF-8文本的SHA-256',
+    createdAt BIGINT NOT NULL COMMENT '快照记录生成时间，毫秒',
+    PRIMARY KEY (id),
+    KEY IDX_SNAPSHOT_SEQ_VERSION (sequenceId, formatVersion)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='交易引擎一致性快照；不替代事件历史或数据库备份';
 
 
 CREATE TABLE hour_bars (

@@ -1,6 +1,6 @@
 /*
  * 交易引擎协调资产、订单、撮合与清算；历史重放复用状态逻辑，但隔离所有对外输出。
- * 启动恢复校验通过后才创建消费者和输出线程；一致性快照将在后续阶段接入。
+ * 启动恢复校验通过后才创建消费者和输出线程；快照在完整事件边界复制，不包含对外输出队列。
  */
 package com.itranswarp.exchange;
 
@@ -16,6 +16,8 @@ import java.util.Map.Entry;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Comparator;
 import jakarta.annotation.PreDestroy;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -53,6 +55,7 @@ import com.itranswarp.exchange.order.OrderService;
 import com.itranswarp.exchange.redis.RedisCache;
 import com.itranswarp.exchange.redis.RedisService;
 import com.itranswarp.exchange.store.StoreService;
+import com.itranswarp.exchange.snapshot.EngineSnapshot;
 import com.itranswarp.exchange.support.LoggerSupport;
 import com.itranswarp.exchange.util.IpUtil;
 import com.itranswarp.exchange.util.JsonUtil;
@@ -411,6 +414,82 @@ public class TradingEngineService extends LoggerSupport {
     /** 返回已完整执行的事件序号；该值不是 Kafka 消费位置或数据库最大序号。 */
     public synchronized long getLastSequenceId() {
         return this.lastSequenceId;
+    }
+
+    /** 返回恢复使用的固定时区；时区影响订单 ID，不能在快照恢复时悄悄更换。 */
+    public String getSnapshotZoneId() {
+        return this.zoneId.getId();
+    }
+
+    /** 在同一事件锁内校验并取得独立不可变状态；调用者在锁外序列化和写数据库。 */
+    public synchronized EngineSnapshot captureSnapshot() {
+        if (fatalError || recoveryState == RecoveryState.FAILED || recoveryState == RecoveryState.STOPPED) {
+            throw new IllegalStateException("不能对失败或停止的引擎生成快照");
+        }
+        validate();
+        List<EngineSnapshot.AssetState> assets = new ArrayList<>();
+        this.assetService.getUserAssets().forEach((user, balances) -> balances.forEach((asset, balance) ->
+                assets.add(new EngineSnapshot.AssetState(user, asset, balance.getAvailable(), balance.getFrozen()))));
+        assets.sort(Comparator.comparingLong(EngineSnapshot.AssetState::userId)
+                .thenComparing(EngineSnapshot.AssetState::asset));
+        List<EngineSnapshot.OrderState> orders = this.orderService.getActiveOrders().values().stream()
+                .sorted(Comparator.comparingLong(order -> order.sequenceId))
+                .map(EngineSnapshot.OrderState::from).toList();
+        EngineSnapshot snapshot = new EngineSnapshot(EngineSnapshot.FORMAT_VERSION, lastSequenceId,
+                zoneId.getId(), matchEngine.marketPrice, assets, orders);
+        snapshot.validateShape();
+        return snapshot;
+    }
+
+    /**
+     * 仅在启动恢复的新状态安装快照。先在独立候选中校验，失败不会污染真实状态。
+     * 安装时保留 Spring 注入的组件对象，避免控制器仍引用旧组件；全局、用户和盘口共享订单。
+     */
+    public synchronized void restoreSnapshot(EngineSnapshot snapshot) {
+        if (!recoveryStarted || recoveryState != RecoveryState.RECOVERING || fatalError || lastSequenceId != 0
+                || !assetService.getUserAssets().isEmpty() || !orderService.getActiveOrders().isEmpty()
+                || !matchEngine.buyBook.book.isEmpty() || !matchEngine.sellBook.book.isEmpty()) {
+            throw new IllegalStateException("快照只能安装到启动恢复的新状态");
+        }
+        snapshot.validateShape();
+        if (!zoneId.getId().equals(snapshot.zoneId())) {
+            throw new IllegalStateException("快照时区与引擎配置不同，禁止改变订单标识语义");
+        }
+        TradingEngineService candidate = new TradingEngineService();
+        candidate.assetService = new AssetService();
+        candidate.orderService = new OrderService(candidate.assetService);
+        candidate.matchEngine = new MatchEngine();
+        for (EngineSnapshot.AssetState asset : snapshot.assets()) {
+            candidate.assetService.getUserAssets().computeIfAbsent(asset.userId(), user -> new ConcurrentHashMap<>())
+                    .put(asset.asset(), new Asset(asset.available(), asset.frozen()));
+        }
+        for (EngineSnapshot.OrderState data : snapshot.orders()) {
+            OrderEntity order = data.toOrder();
+            candidate.orderService.restoreOrder(order);
+            if (!(order.direction == Direction.BUY ? candidate.matchEngine.buyBook : candidate.matchEngine.sellBook)
+                    .add(order)) {
+                throw new IllegalArgumentException("快照订单簿优先级重复");
+            }
+        }
+        candidate.matchEngine.marketPrice = snapshot.marketPrice();
+        try {
+            candidate.validate();
+            OrderEntity buy = candidate.matchEngine.buyBook.getFirst();
+            OrderEntity sell = candidate.matchEngine.sellBook.getFirst();
+            if (buy != null && sell != null && buy.price.compareTo(sell.price) >= 0) {
+                throw new IllegalStateException("快照包含尚未撮合的交叉盘口");
+            }
+        } catch (IllegalStateException e) {
+            throw new IllegalArgumentException("快照业务状态不一致", e);
+        }
+        this.assetService.getUserAssets().putAll(candidate.assetService.getUserAssets());
+        for (OrderEntity order : candidate.orderService.getActiveOrders().values()) {
+            this.orderService.restoreOrder(order);
+        }
+        this.matchEngine.buyBook.book.putAll(candidate.matchEngine.buyBook.book);
+        this.matchEngine.sellBook.book.putAll(candidate.matchEngine.sellBook.book);
+        this.matchEngine.marketPrice = snapshot.marketPrice();
+        this.lastSequenceId = snapshot.sequenceId();
     }
 
     /** 共用事件顺序检查与状态分发，执行模式只控制输出和重放失败行为。 */
