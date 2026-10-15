@@ -1,0 +1,9 @@
+# Prometheus 从 Docker 访问 IDEA 中的引擎管理端口；不抓取资产或业务查询接口。
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+scrape_configs:
+  - job_name: trading-engine
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:18002"]

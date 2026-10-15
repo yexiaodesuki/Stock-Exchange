@@ -1,4 +1,4 @@
-/* 一致性快照回归：验证完整状态与增量重放等价，隔离数据库、Redis、Kafka 和周期线程。 */
+/* 一致性快照回归：验证状态与增量重放等价，以及真实执行入口的监控埋点；隔离业务中间件。 */
 package com.itranswarp.exchange;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -31,11 +31,49 @@ import com.itranswarp.exchange.snapshot.SnapshotRecord;
 import com.itranswarp.exchange.snapshot.SnapshotStore;
 import com.itranswarp.exchange.snapshot.SnapshotService;
 import com.itranswarp.exchange.store.StoreService;
+import com.itranswarp.exchange.monitoring.EngineMonitoringService;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 class SnapshotRecoveryTest {
     private static final long TIME = Instant.parse("2026-01-02T03:04:05Z").toEpochMilli();
     private static final long BUYER = 1001;
     private static final long SELLER = 1002;
+
+    /** 真实执行与快照入口必须推进指标；重复、空闲跳过和写入失败不能虚增成功位置。 */
+    @Test
+    void monitoringFollowsActualEventsAndSnapshotPersistence() {
+        var registry = new SimpleMeterRegistry();
+        TestEngine engine = engine();
+        engine.monitoring = new EngineMonitoringService(registry);
+        engine.bindMonitoring();
+        var rows = new MemorySnapshots();
+        var snapshots = new SnapshotService(engine, rows);
+        try {
+            engine.replayEvents(history());
+            assertEquals(8, registry.get("exchange.engine.applied.sequence").gauge().value());
+            assertEquals(8, registry.get("exchange.events").tags("mode", "replay", "result", "applied").counter().count());
+            assertEquals(0, registry.get("exchange.output.pending").tag("queue", "ticks").gauge().value());
+            snapshots.saveRecoveredState();
+            ReflectionTestUtils.setField(engine, "recoveryState", TradingEngineService.RecoveryState.READY);
+            snapshots.savePeriodically();
+            assertEquals(1, registry.get("exchange.snapshot.save").tag("result", "success").counter().count());
+            var event = deposit(9, BUYER, AssetEnum.USD, "10");
+            engine.processMessages(List.of(event, event));
+            assertEquals(1, registry.get("exchange.events").tags("mode", "live", "result", "applied").counter().count());
+            assertEquals(1, registry.get("exchange.events").tags("mode", "live", "result", "duplicate").counter().count());
+            rows.failWrite = true;
+            snapshots.savePeriodically();
+            assertEquals(8, registry.get("exchange.snapshot.saved.sequence").gauge().value());
+            assertEquals(1, registry.get("exchange.snapshot.save").tag("result", "failure").counter().count());
+            rows.failWrite = false;
+            snapshots.savePeriodically();
+            assertEquals(9, registry.get("exchange.snapshot.saved.sequence").gauge().value());
+        } finally {
+            snapshots.stop();
+            engine.destroy();
+            registry.close();
+        }
+    }
 
     /** 全新空库首次启动先保存零序号快照再开放业务；下次启动能读取该快照且不虚构资金。 */
     @Test

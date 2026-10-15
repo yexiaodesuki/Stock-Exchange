@@ -44,10 +44,10 @@ public class SnapshotService extends LoggerSupport {
         logger.info("没有有效快照，使用完整事件历史恢复");
     }
 
-    /** 启动时必须保存完整恢复结果；写入失败由恢复协调器阻止开放服务，先确保迁移已执行。 */
+    /** 启动时必须保存完整恢复结果；写入失败阻止开放服务，快照表由完整初始化创建。 */
     public synchronized void saveRecoveredState() {
         if (intervalMs < 1) throw new IllegalArgumentException("快照检查间隔必须大于零");
-        persist(engine.captureSnapshot());
+        saveCurrentState();
     }
 
     /** 就绪后启动单个串行任务；初次任务等待完整间隔，不与启动快照并发写入。 */
@@ -67,17 +67,27 @@ public class SnapshotService extends LoggerSupport {
         if (engine.getRecoveryState() != TradingEngineService.RecoveryState.READY) return;
         if (engine.getLastSequenceId() == lastSavedSequence) return;
         try {
-            persist(engine.captureSnapshot());
+            saveCurrentState();
         } catch (Exception e) {
             logger.error("定期快照保存失败，将在下轮重试；仍需保留完整事件历史", e);
         }
     }
 
-    /** 捕获已在引擎锁内完成，序列化和数据库事务在锁外执行；仅提交成功才推进记录位置。 */
-    private void persist(EngineSnapshot snapshot) {
-        store.save(SnapshotCodec.encode(snapshot));
-        lastSavedSequence = snapshot.sequenceId();
-        logger.info("快照保存成功，序号={}", lastSavedSequence);
+    /** 统计捕获、编码及提交完整耗时；失败不推进保存位置，指标不覆盖原始异常。 */
+    private void saveCurrentState() {
+        long started = engine.getMonitoring().snapshotStarted();
+        boolean success = false;
+        long sequence = -1;
+        try {
+            EngineSnapshot snapshot = engine.captureSnapshot();
+            store.save(SnapshotCodec.encode(snapshot));
+            sequence = snapshot.sequenceId();
+            lastSavedSequence = sequence;
+            success = true;
+            logger.info("快照保存成功，序号={}", lastSavedSequence);
+        } finally {
+            engine.getMonitoring().snapshotFinished(started, sequence, success);
+        }
     }
 
     /** 停止定期任务，不以停机快照作为唯一保障；未提交记录不会成为恢复候选。 */

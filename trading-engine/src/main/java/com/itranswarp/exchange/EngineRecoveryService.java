@@ -1,6 +1,6 @@
 /*
  * 启动时从有效快照与 MySQL 增量事件恢复引擎，校验并保存快照后才开放业务。
- * 无有效快照时全量重放；要求单引擎运行，本阶段不裁剪事件历史。
+ * 无有效快照时全量重放；记录恢复目标、耗时和结果；要求单引擎运行，不裁剪事件历史。
  */
 package com.itranswarp.exchange;
 
@@ -30,12 +30,14 @@ public class EngineRecoveryService extends LoggerSupport implements ApplicationR
         this.snapshots = snapshots;
     }
 
-    /** Spring 启动完成后执行有限上界重放；失败向启动流程抛出，不开放半恢复状态。 */
+    /** Spring 启动后执行有限上界重放并记录结果；失败向启动流程抛出，不开放半恢复状态。 */
     @Override
     public void run(ApplicationArguments args) {
+        long started = engine.getMonitoring().recoveryStarted();
         try {
             engine.beginRecovery();
             long target = store.getLatestEventSequenceId();
+            engine.getMonitoring().recoveryTarget(target);
             snapshots.restoreLatest(target);
             logger.info("开始恢复交易引擎，历史上界={}", target);
             while (engine.getLastSequenceId() < target) {
@@ -53,10 +55,12 @@ public class EngineRecoveryService extends LoggerSupport implements ApplicationR
             snapshots.saveRecoveredState();
             engine.startAfterRecovery();
             snapshots.startPeriodic();
+            engine.getMonitoring().recoveryFinished(started, true);
             logger.info("交易引擎恢复完成，已应用序号={}", engine.getLastSequenceId());
         } catch (Exception e) {
             snapshots.stop();
             engine.failRecovery();
+            engine.getMonitoring().recoveryFinished(started, false);
             throw new IllegalStateException("交易引擎恢复失败，禁止开放业务", e);
         }
     }

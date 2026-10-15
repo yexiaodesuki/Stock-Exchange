@@ -14,11 +14,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.Comparator;
 import jakarta.annotation.PreDestroy;
+import jakarta.annotation.PostConstruct;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -56,12 +56,31 @@ import com.itranswarp.exchange.redis.RedisCache;
 import com.itranswarp.exchange.redis.RedisService;
 import com.itranswarp.exchange.store.StoreService;
 import com.itranswarp.exchange.snapshot.EngineSnapshot;
+import com.itranswarp.exchange.monitoring.EngineMonitoringService;
+import com.itranswarp.exchange.monitoring.EngineMonitoringService.Output;
+import com.itranswarp.exchange.monitoring.PendingQueue;
 import com.itranswarp.exchange.support.LoggerSupport;
 import com.itranswarp.exchange.util.IpUtil;
 import com.itranswarp.exchange.util.JsonUtil;
 
 @Component
 public class TradingEngineService extends LoggerSupport {
+
+    @Autowired
+    EngineMonitoringService monitoring = new EngineMonitoringService();
+
+    /** Spring 注入注册表后绑定常数时间队列指标；不启动任何业务线程或网络请求。 */
+    @PostConstruct
+    public void bindMonitoring() {
+        monitoring.bindQueue("orders", orderQueue);
+        monitoring.bindQueue("matches", matchQueue);
+        monitoring.bindQueue("ticks", tickQueue);
+        monitoring.bindQueue("api_results", apiResultQueue);
+        monitoring.bindQueue("notifications", notificationQueue);
+    }
+
+    /** 为恢复和快照协调器共享同一监控状态；返回不需要取得引擎锁。 */
+    public EngineMonitoringService getMonitoring() { return monitoring; }
 
     @Autowired(required = false)
     ZoneId zoneId = ZoneId.systemDefault();
@@ -120,11 +139,11 @@ public class TradingEngineService extends LoggerSupport {
     private Thread dbThread;
 
     private volatile OrderBookBean latestOrderBook = null;
-    private Queue<List<OrderEntity>> orderQueue = new ConcurrentLinkedQueue<>();
-    private Queue<List<MatchDetailEntity>> matchQueue = new ConcurrentLinkedQueue<>();
-    private Queue<TickMessage> tickQueue = new ConcurrentLinkedQueue<>();
-    private Queue<ApiResultMessage> apiResultQueue = new ConcurrentLinkedQueue<>();
-    private Queue<NotificationMessage> notificationQueue = new ConcurrentLinkedQueue<>();
+    private Queue<List<OrderEntity>> orderQueue = new PendingQueue<>();
+    private Queue<List<MatchDetailEntity>> matchQueue = new PendingQueue<>();
+    private Queue<TickMessage> tickQueue = new PendingQueue<>();
+    private Queue<ApiResultMessage> apiResultQueue = new PendingQueue<>();
+    private Queue<NotificationMessage> notificationQueue = new PendingQueue<>();
 
     /** 只允许新引擎开始一次恢复，不允许在线清空或覆盖已经处理的状态。 */
     public synchronized void beginRecovery() {
@@ -132,6 +151,7 @@ public class TradingEngineService extends LoggerSupport {
             throw new IllegalStateException("引擎不是可恢复的新状态");
         }
         this.recoveryStarted = true;
+        monitoring.state("RECOVERING");
     }
 
     /** 恢复后发布一次当前盘口，再启动实时消费；任意初始化失败由恢复协调器清理。 */
@@ -148,20 +168,37 @@ public class TradingEngineService extends LoggerSupport {
             throw new IllegalStateException("Redis 盘口位置领先于恢复位置，拒绝开放可能过期的引擎");
         }
         this.producer = this.messagingFactory.createMessageProducer(Topic.TICK, TickMessage.class);
-        this.tickThread = new Thread(this::runTickThread, "async-tick");
+        this.tickThread = newOutputThread(Output.TICK, this::runTickThread, "async-tick");
         this.tickThread.start();
-        this.notifyThread = new Thread(this::runNotifyThread, "async-notify");
+        this.notifyThread = newOutputThread(Output.NOTIFY, this::runNotifyThread, "async-notify");
         this.notifyThread.start();
-        this.orderBookThread = new Thread(this::runOrderBookThread, "async-orderbook");
+        this.orderBookThread = newOutputThread(Output.ORDERBOOK, this::runOrderBookThread, "async-orderbook");
         this.orderBookThread.start();
-        this.apiResultThread = new Thread(this::runApiResultThread, "async-api-result");
+        this.apiResultThread = newOutputThread(Output.API_RESULT, this::runApiResultThread, "async-api-result");
         this.apiResultThread.start();
-        this.dbThread = new Thread(this::runDbThread, "async-db");
+        this.dbThread = newOutputThread(Output.DB, this::runDbThread, "async-db");
         this.dbThread.start();
         // earliest 只用于没有有效消费位置时；启动窗口内的新事件不能从 latest 开始而被跳过。
         this.consumer = this.messagingFactory.createBatchMessageListener(Messaging.Topic.TRADE, IpUtil.getHostId(),
                 this::onTradeMessages, null, "earliest");
         this.recoveryState = RecoveryState.READY;
+        monitoring.expectWorkers(true);
+        monitoring.state("READY");
+    }
+
+    /** 包装输出线程以观察异常退出，保留原异常和退出行为，不添加自动重试。 */
+    private Thread newOutputThread(Output output, Runnable action, String name) {
+        // 回调只捕获未处理故障；正常中断或停机不增加失败计数。
+        Thread thread = new Thread(() -> {
+            try {
+                action.run();
+            } catch (RuntimeException | Error e) {
+                if (recoveryState != RecoveryState.STOPPED) monitoring.outputFailed(output);
+                throw e;
+            }
+        }, name);
+        monitoring.bindWorker(output, thread);
+        return thread;
     }
 
     /** 查询可见的生命周期状态；致命错误即使尚未清理线程也不得报告就绪。 */
@@ -181,6 +218,8 @@ public class TradingEngineService extends LoggerSupport {
     public void failRecovery() {
         this.fatalError = true;
         this.recoveryState = RecoveryState.FAILED;
+        monitoring.state("FAILED");
+        monitoring.expectWorkers(false);
         stopResources();
     }
 
@@ -188,6 +227,8 @@ public class TradingEngineService extends LoggerSupport {
     @PreDestroy
     public void destroy() {
         this.recoveryState = RecoveryState.STOPPED;
+        monitoring.state("STOPPED");
+        monitoring.expectWorkers(false);
         stopResources();
     }
 
@@ -214,7 +255,7 @@ public class TradingEngineService extends LoggerSupport {
         return book;
     }
 
-    /** 从实时输出队列发送 Tick；收到关闭信号即停止，不负责历史行情补偿。 */
+    /** 从实时队列发送 Tick 并统计调用正常返回；不等待 broker 确认，不负责历史补偿。 */
     private void runTickThread() {
         logger.info("start tick thread...");
         while (!Thread.currentThread().isInterrupted()) {
@@ -235,6 +276,7 @@ public class TradingEngineService extends LoggerSupport {
                     logger.debug("send {} tick messages...", msgs.size());
                 }
                 this.producer.sendMessages(msgs);
+                monitoring.tickSendReturned();
             } else {
                 // 无TickMessage时，暂停1ms:
                 try {
@@ -490,10 +532,32 @@ public class TradingEngineService extends LoggerSupport {
         this.matchEngine.sellBook.book.putAll(candidate.matchEngine.sellBook.book);
         this.matchEngine.marketPrice = snapshot.marketPrice();
         this.lastSequenceId = snapshot.sequenceId();
+        monitoring.applied(this.lastSequenceId);
     }
 
-    /** 共用事件顺序检查与状态分发，执行模式只控制输出和重放失败行为。 */
+    /** 统计完整执行、重复和失败；缺口补读仅统计实际执行的子事件，避免重复计数。 */
     private void executeEvent(AbstractEvent event, EventExecutionMode mode) {
+        if (fatalError) return;
+        long previous = lastSequenceId;
+        boolean gap = mode == EventExecutionMode.LIVE && event.sequenceId > previous && event.previousId > previous;
+        long start = System.nanoTime();
+        boolean failed = false;
+        try {
+            applyEvent(event, mode);
+        } catch (RuntimeException | Error e) {
+            failed = true;
+            monitoring.state("FAILED");
+            throw e;
+        } finally {
+            if (!gap) {
+                String result = failed || fatalError ? "failure" : event.sequenceId <= previous ? "duplicate" : "applied";
+                monitoring.event(mode == EventExecutionMode.LIVE ? "live" : "replay", result, start);
+            }
+        }
+    }
+
+    /** 保留原有顺序检查与状态分发，执行模式只控制输出和重放失败行为。 */
+    private void applyEvent(AbstractEvent event, EventExecutionMode mode) {
         if (this.fatalError) {
             return;
         }
@@ -557,6 +621,7 @@ public class TradingEngineService extends LoggerSupport {
             return;
         }
         this.lastSequenceId = event.sequenceId;
+        monitoring.applied(this.lastSequenceId);
         if (logger.isDebugEnabled()) {
             logger.debug("set last processed sequence id: {}...", this.lastSequenceId);
         }
@@ -565,9 +630,11 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
+    /** 保留实时致命故障退出行为，退出前记录失败状态，监控不修复交易状态。 */
     private void panic() {
         logger.error("application panic. exit now...");
         this.fatalError = true;
+        monitoring.state("FAILED");
         System.exit(1);
     }
 
