@@ -1,3 +1,4 @@
+/* 行情消费观测：业务序号可能提前推进，完整成功位置使用独立监控字段。 */
 package com.itranswarp.exchange.quotation;
 
 import java.math.BigDecimal;
@@ -35,6 +36,9 @@ import com.itranswarp.exchange.util.JsonUtil;
 
 @Component
 public class QuotationService extends LoggerSupport {
+
+    @Autowired
+    private com.itranswarp.exchange.monitoring.PipelineMonitoring monitoring = new com.itranswarp.exchange.monitoring.PipelineMonitoring();
 
     @Autowired
     private ZoneId zoneId;
@@ -82,10 +86,28 @@ public class QuotationService extends LoggerSupport {
         }
     }
 
+    /** 观测消息与成交记录数量，完整 Redis 和数据库路径成功后才推进完成位置。 */
     void processMessage(TickMessage message) {
+        long started = System.nanoTime();
+        monitoring.count("quotation_messages", "received");
+        monitoring.count("quotation_ticks", "received", message.ticks.size());
+        try {
+            if (applyMessage(message)) {
+                monitoring.count("quotation", "success");
+                monitoring.progress("quotation", message.sequenceId);
+            }
+        } catch (RuntimeException | Error e) {
+            monitoring.count("quotation", "failure");
+            throw e;
+        } finally { monitoring.duration("quotation", started); }
+    }
+
+    /** 保留原始去重与更新顺序；返回 false 只表示旧消息或 Redis 拒绝，本阶段不修复投影。 */
+    boolean applyMessage(TickMessage message) {
         // 忽略重复的消息:
         if (message.sequenceId < this.sequenceId) {
-            return;
+            monitoring.count("quotation", "duplicate");
+            return false;
         }
         if (logger.isDebugEnabled()) {
             logger.debug("process ticks: sequenceId = {}, {} ticks...", message.sequenceId, message.ticks.size());
@@ -136,7 +158,8 @@ public class QuotationService extends LoggerSupport {
                 new String[] { String.valueOf(this.sequenceId), ticksData, ticksStrJoiner.toString() });
         if (!tickOk.booleanValue()) {
             logger.warn("ticks are ignored by Redis.");
-            return;
+            monitoring.count("quotation", "redis_rejected");
+            return false;
         }
         // 保存Tick至数据库:
         this.quotationDbService.saveTicks(message.ticks);
@@ -167,6 +190,7 @@ public class QuotationService extends LoggerSupport {
             DayBarEntity dayBar = createBar(DayBarEntity::new, barMap.get(BarType.DAY));
             this.quotationDbService.saveBars(secBar, minBar, hourBar, dayBar);
         }
+        return true;
     }
 
     static <T extends AbstractBarEntity> T createBar(Supplier<T> fn, BigDecimal[] data) {

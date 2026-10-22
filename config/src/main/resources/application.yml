@@ -1,4 +1,4 @@
-# config server port:
+# 配置中心本地配置：不向自身取配置，管理接口与业务接口分离。
 server:
   port: 8888
 
@@ -12,3 +12,25 @@ spring:
       server:
         native:
           search-locations: file:./config-repo, file:../config-repo, file:../../config-repo, file:../../../config-repo
+
+management:
+  server:
+    port: ${CONFIG_MANAGEMENT_PORT:18888}
+    address: ${MANAGEMENT_ADDRESS:0.0.0.0}
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState
+  metrics:
+    tags:
+      application: config-server

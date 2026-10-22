@@ -1,4 +1,4 @@
-/* 交易与行情 HTTP 入口：引擎状态查询和交易依赖就绪门控，历史行情仍由原服务负责。 */
+/* 交易与行情入口：保留业务语义，观测异步等待、超时和迟到结果，不泄露请求维度。 */
 package com.itranswarp.exchange.web.api;
 
 import java.io.IOException;
@@ -46,6 +46,10 @@ import com.itranswarp.exchange.util.JsonUtil;
 @RestController
 @RequestMapping("/api")
 public class TradingApiController extends AbstractApiController {
+
+    @Autowired
+    private com.itranswarp.exchange.service.ApiRequestMonitoring requestMonitoring =
+            new com.itranswarp.exchange.service.ApiRequestMonitoring(new com.itranswarp.exchange.monitoring.PipelineMonitoring());
 
     @Autowired
     private HistoryService historyService;
@@ -197,7 +201,7 @@ public class TradingApiController extends AbstractApiController {
         return this.historyService.getHistoryMatchDetails(orderId);
     }
 
-    /** 撤单前检查归属与就绪；若发送失败，移除异步等待项，防止留下无响应请求。 */
+    /** 撤单前检查归属与就绪；所有等待终止路径都清理一次观测项。 */
     @PostMapping(value = "/orders/{orderId}/cancel", produces = "application/json")
     @ResponseBody
     public DeferredResult<ResponseEntity<String>> cancelOrder(@PathVariable("orderId") Long orderId) throws Exception {
@@ -217,20 +221,28 @@ public class TradingApiController extends AbstractApiController {
         deferred.onTimeout(() -> {
             logger.warn("deferred order {} cancel request refId={} timeout.", orderId, refId);
             this.deferredResultMap.remove(refId);
+            this.requestMonitoring.finished(refId, "timeout");
         });
         // track deferred:
         this.deferredResultMap.put(refId, deferred);
+        this.requestMonitoring.started(refId, "cancel");
+        // 容器完成回调兜底清理，正常结果已完成时不会重复计数。
+        deferred.onCompletion(() -> {
+            this.deferredResultMap.remove(refId, deferred);
+            this.requestMonitoring.finished(refId, "completed_without_result");
+        });
         logger.info("cancel order message created: {}", message);
         try {
             this.sendEventService.sendMessage(message);
         } catch (RuntimeException e) {
             this.deferredResultMap.remove(refId);
+            this.requestMonitoring.finished(refId, "send_failure");
             throw e;
         }
         return deferred;
     }
 
-    /** 下单前检查引擎就绪；发送失败清理异步等待项，不让恢复中请求进入定序系统。 */
+    /** 下单保留原有门控和响应，观测发送失败、超时和正常结果且不重复计数。 */
     @PostMapping(value = "/orders", produces = "application/json")
     @ResponseBody
     public DeferredResult<ResponseEntity<String>> createOrder(@RequestBody OrderRequestBean orderRequest)
@@ -252,13 +264,21 @@ public class TradingApiController extends AbstractApiController {
         deferred.onTimeout(() -> {
             logger.warn("deferred order request refId = {} timeout.", event.refId);
             this.deferredResultMap.remove(event.refId);
+            this.requestMonitoring.finished(event.refId, "timeout");
         });
         // track deferred:
         this.deferredResultMap.put(event.refId, deferred);
+        this.requestMonitoring.started(event.refId, "create");
+        // 完成不等于下单成功，仅清理尚未通过其他路径终止的观测。
+        deferred.onCompletion(() -> {
+            this.deferredResultMap.remove(event.refId, deferred);
+            this.requestMonitoring.finished(event.refId, "completed_without_result");
+        });
         try {
             this.sendEventService.sendMessage(event);
         } catch (RuntimeException e) {
             this.deferredResultMap.remove(event.refId);
+            this.requestMonitoring.finished(event.refId, "send_failure");
             throw e;
         }
         return deferred;
@@ -266,6 +286,7 @@ public class TradingApiController extends AbstractApiController {
 
     // message callback ///////////////////////////////////////////////////////
 
+    /** Redis 结果只有成功设置响应时才算收到结果，迟到或重复结果不重复完成请求。 */
     public void onApiResultMessage(String msg) {
         logger.info("on subscribed message: {}", msg);
         try {
@@ -276,11 +297,13 @@ public class TradingApiController extends AbstractApiController {
                     if (message.error != null) {
                         String error = objectMapper.writeValueAsString(message.error);
                         ResponseEntity<String> resp = new ResponseEntity<>(error, HttpStatus.BAD_REQUEST);
-                        deferred.setResult(resp);
+                        boolean accepted = deferred.setResult(resp);
+                        this.requestMonitoring.finished(message.refId, accepted ? "rejected" : "expired");
                     } else {
                         ResponseEntity<String> resp = new ResponseEntity<>(JsonUtil.writeJson(message.result),
                                 HttpStatus.OK);
-                        deferred.setResult(resp);
+                        boolean accepted = deferred.setResult(resp);
+                        this.requestMonitoring.finished(message.refId, accepted ? "success" : "expired");
                     }
                 }
             }

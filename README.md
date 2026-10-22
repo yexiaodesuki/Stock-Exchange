@@ -1,4 +1,4 @@
-<!-- 项目说明：完整初始化一次建表，日常启动自动恢复引擎；独立监控不重建业务数据。 -->
+<!-- 项目说明：初始化一次建表、日常自动恢复；七应用独立监控不重建业务数据。 -->
 # Stock Exchange
 
 一个基于 Java 和 Spring Cloud 的交易系统雏形，包含资产管理、订单处理、撮合交易、清算、行情与实时推送等基础功能。项目处于初步开发阶段，后续将持续更新与优化。
@@ -52,7 +52,9 @@ MySQL 使用空的 `build/docker/mysql-data` 目录时，会自动执行 `build/
 
 ## 交易引擎监控
 
-交易引擎已接入健康检查、Prometheus 指标与预置 Grafana 仪表盘。监控使用独立管理端口和 Docker Compose，启动与验证详见 [交易引擎监控说明](docs/engine-monitoring.md)。当前仅覆盖引擎，不包含通知告警或分布式链路追踪。
+第一阶段为交易引擎接入健康检查、Prometheus 指标与预置 Grafana 仪表盘。监控使用独立管理端口和 Docker Compose，启动与验证详见 [交易引擎监控说明](docs/engine-monitoring.md)。
+
+第二阶段扩展到 UI、交易 API、定序、行情、Push 和配置中心，新增应用视角 MySQL/Redis/Kafka 监控及系统总览、依赖与消息链路面板。启动、指标语义和验证边界详见 [系统与依赖监控](docs/system-monitoring.md)；不包含通知告警、分布式链路追踪或完整中间件服务端监控。
 
 ## 后续计划
 

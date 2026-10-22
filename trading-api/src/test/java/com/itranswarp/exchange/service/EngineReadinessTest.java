@@ -1,4 +1,4 @@
-/* 交易 API 就绪门控测试：不连接 Kafka 或 Docker，验证写入拦截、异步清理和 HTTP 503。 */
+/* API 就绪门控与指标：隔离网络，验证写入拦截、原 503 语义和直接检查的指标。 */
 package com.itranswarp.exchange.service;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -29,6 +29,23 @@ import okhttp3.Response;
 import okhttp3.ResponseBody;
 
 class EngineReadinessTest {
+    /** 控制器直接检查也会经过代理埋点，避免只在发送入口计数导致漏记。 */
+    @Test void metricsObserveDirectReadinessChecks() {
+        var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
+        var monitoring = new com.itranswarp.exchange.monitoring.PipelineMonitoring(registry);
+        var ready = realProxy(200, "{\"ready\":true}", false);
+        var recovering = realProxy(200, "{\"ready\":false}", false);
+        ReflectionTestUtils.setField(ready, "monitoring", monitoring);
+        ReflectionTestUtils.setField(recovering, "monitoring", monitoring);
+        try {
+            ready.requireReady();
+            assertThrows(ApiException.class, recovering::requireReady);
+            assertEquals(1, registry.get("exchange.pipeline.operations").tags("stage", "engine_gate", "result", "success").counter().count());
+            assertEquals(1, registry.get("exchange.pipeline.operations").tags("stage", "engine_gate", "result", "failure").counter().count());
+            assertEquals(2, registry.get("exchange.pipeline.duration").tag("stage", "engine_gate").timer().count());
+        } finally { registry.close(); }
+    }
+
     /** 真实 HTTP 探针只接受明确 ready=true，503、错误码及损坏响应都应失败关闭。 */
     @Test
     void realProbeFailsClosedOnInvalidResponses() {

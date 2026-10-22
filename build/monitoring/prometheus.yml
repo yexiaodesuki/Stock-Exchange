@@ -1,4 +1,4 @@
-# Prometheus 从 Docker 访问 IDEA 中的引擎管理端口；不抓取资产或业务查询接口。
+# Prometheus 从 Docker 访问七个应用的独立管理端口；不抓取资产、Token 或业务查询接口。
 global:
   scrape_interval: 15s
   scrape_timeout: 5s
@@ -7,3 +7,27 @@ scrape_configs:
     metrics_path: /actuator/prometheus
     static_configs:
       - targets: ["host.docker.internal:18002"]
+  - job_name: ui
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:18000"]
+  - job_name: trading-api
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:18001"]
+  - job_name: trading-sequencer
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:18003"]
+  - job_name: quotation
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:18005"]
+  - job_name: push
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:18006"]
+  - job_name: config-server
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:18888"]

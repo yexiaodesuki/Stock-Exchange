@@ -1,5 +1,7 @@
-<!-- 交易引擎监控使用说明：限定本地开发部署，区分已验证的埋点和待执行的容器联调。 -->
+<!-- 第一阶段引擎监控说明：保留本地修改；第二阶段应用与依赖扩展在独立说明中记录。 -->
 # 交易引擎监控（第一阶段）
+
+第二阶段的七应用端口、依赖缓存、消息与 Push 指标见 [系统与依赖监控](system-monitoring.md)。本页保留第一阶段说明。
 
 ## 范围和流程
 
@@ -12,7 +14,7 @@
 1. 日常方式开启原有 MySQL、Redis、Kafka；不要删容器、数据或重新执行 schema.sql。
 2. IDEA 重新加载 Maven；启动或重启 ConfigApplication，然后重启 TradingEngineApplication，让新的集中配置生效。新配置不会自动应用到已经启动的引擎。
 3. 浏览器打开 `http://localhost:18002/actuator/health/readiness`：恢复中或输出线程退出时为 HTTP 503，完整就绪时为 200。`/actuator/health/liveness` 只证明 Spring 进程存活，不代表可以交易。
-4. 打开 `http://localhost:18002/actuator/prometheus`，应出现 `exchange_engine_ready`、`exchange_engine_applied_sequence` 等指标。
+4. 打开 `                                                                  `，应出现 `exchange_engine_ready`、`exchange_engine_applied_sequence` 等指标。
 5. 在项目根目录 PowerShell 执行：
 
 ```powershell

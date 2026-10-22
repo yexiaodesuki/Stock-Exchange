@@ -1,3 +1,4 @@
+/* 定序生命周期与事务返回观测：成功位置只在事务代理正常返回后推进。 */
 package com.itranswarp.exchange.sequencer;
 
 import java.util.List;
@@ -27,6 +28,9 @@ import com.itranswarp.exchange.support.LoggerSupport;
 @Component
 public class SequenceService extends LoggerSupport implements CommonErrorHandler {
 
+    @Autowired
+    private com.itranswarp.exchange.monitoring.PipelineMonitoring monitoring = new com.itranswarp.exchange.monitoring.PipelineMonitoring();
+
     private static final String GROUP_ID = "SequencerGroup";
 
     @Autowired
@@ -42,8 +46,9 @@ public class SequenceService extends LoggerSupport implements CommonErrorHandler
 
     private AtomicLong sequence;
     private Thread jobThread;
-    private boolean running;
+    private volatile boolean running;
 
+    /** 启动原工作线程并绑定可见状态，不因监控额外创建消费者。 */
     @PostConstruct
     public void init() {
         Thread thread = new Thread(() -> {
@@ -76,6 +81,7 @@ public class SequenceService extends LoggerSupport implements CommonErrorHandler
             System.exit(1);
         });
         this.jobThread = thread;
+        monitoring.component("sequencer", () -> jobThread != null && jobThread.isAlive() && running && !crash);
         this.jobThread.start();
     }
 
@@ -94,7 +100,7 @@ public class SequenceService extends LoggerSupport implements CommonErrorHandler
         }
     }
 
-    private boolean crash = false;
+    private volatile boolean crash = false;
 
     /**
      * Message consumer error handler
@@ -110,6 +116,7 @@ public class SequenceService extends LoggerSupport implements CommonErrorHandler
         this.messageProducer.sendMessages(messages);
     }
 
+    /** 事务调用结束才统计成功；原有致命错误处理与后续发送顺序不变。 */
     private synchronized void processMessages(List<AbstractEvent> messages) {
         if (!running || crash) {
             panic();
@@ -121,7 +128,7 @@ public class SequenceService extends LoggerSupport implements CommonErrorHandler
         long start = System.currentTimeMillis();
         List<AbstractEvent> sequenced = null;
         try {
-            sequenced = this.sequenceHandler.sequenceMessages(this.messageTypes, this.sequence, messages);
+            sequenced = sequenceAndObserve(messages);
         } catch (Throwable e) {
             logger.error("exception when do sequence", e);
             shutdown();
@@ -135,6 +142,20 @@ public class SequenceService extends LoggerSupport implements CommonErrorHandler
                     this.sequence.get());
         }
         sendMessages(sequenced);
+    }
+
+    /** 包含事务提交耗时；提交失败不能推进已成功定序位置，异常交回原处理路径。 */
+    List<AbstractEvent> sequenceAndObserve(List<AbstractEvent> messages) throws Exception {
+        long started = System.nanoTime();
+        try {
+            List<AbstractEvent> result = sequenceHandler.sequenceMessages(messageTypes, sequence, messages);
+            monitoring.count("sequence", "success", result.size());
+            monitoring.progress("sequence", sequence.get());
+            return result;
+        } catch (Exception | Error e) {
+            monitoring.count("sequence", "failure");
+            throw e;
+        } finally { monitoring.duration("sequence", started); }
     }
 
     private void panic() {

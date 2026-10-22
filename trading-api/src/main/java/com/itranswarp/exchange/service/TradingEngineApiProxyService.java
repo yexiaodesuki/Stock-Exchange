@@ -1,4 +1,4 @@
-/* 引擎 HTTP 代理：查询与写入前检查就绪，并将恢复中或不可达错误映射为 503。 */
+/* 引擎 HTTP 代理：统一观测所有显式就绪检查，保留不可达和恢复中的 503 语义。 */
 package com.itranswarp.exchange.service;
 
 import java.io.IOException;
@@ -24,6 +24,9 @@ import okhttp3.ResponseBody;
 @Component
 public class TradingEngineApiProxyService extends LoggerSupport {
 
+    @org.springframework.beans.factory.annotation.Autowired
+    private com.itranswarp.exchange.monitoring.PipelineMonitoring monitoring = new com.itranswarp.exchange.monitoring.PipelineMonitoring();
+
     @Value("#{exchangeConfiguration.apiEndpoints.tradingEngineApi}")
     private String tradingEngineInternalApiEndpoint;
 
@@ -37,15 +40,20 @@ public class TradingEngineApiProxyService extends LoggerSupport {
             // do not retry:
             .retryOnConnectionFailure(false).build();
 
-    /** 查询引擎就绪状态；失败时禁止创建异步交易请求，不向定序 Topic 发送事件。 */
+    /** 统一观测控制器及发送入口的就绪检查，不改变超时、重试或 503 语义。 */
     public void requireReady() {
+        long started = System.nanoTime();
         try {
             Map<?, ?> status = JsonUtil.readJson(get("/internal/status"), Map.class);
             if (!Boolean.TRUE.equals(status.get("ready"))) {
                 throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎尚未就绪");
             }
+            monitoring.count("engine_gate", "success");
         } catch (IOException | RuntimeException e) {
+            monitoring.count("engine_gate", "failure");
             throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎未就绪或探针失败，请稍后重试");
+        } finally {
+            monitoring.duration("engine_gate", started);
         }
     }
 
