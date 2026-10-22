@@ -1,4 +1,32 @@
-# trading-engine configuration
+# 交易引擎配置：完整初始化包含快照表；独立管理端口只提供健康与指标，不对公网部署。
 
 server:
   port: ${APP_PORT:8002}
+
+exchange:
+  snapshot:
+    # 检查间隔（毫秒）；不是每个事件写一次，单实例运行且暂不自动删除历史。
+    interval-ms: ${ENGINE_SNAPSHOT_INTERVAL_MS:60000}
+
+# 管理端口需可被 Docker Desktop 抓取；0.0.0.0 需配合本机防火墙，禁止直接暴露公网。
+management:
+  server:
+    port: ${ENGINE_MANAGEMENT_PORT:18002}
+    address: ${ENGINE_MANAGEMENT_ADDRESS:0.0.0.0}
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState,engine
+  metrics:
+    tags:
+      application: trading-engine

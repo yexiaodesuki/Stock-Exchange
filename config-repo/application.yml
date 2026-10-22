@@ -1,4 +1,4 @@
-# global configurations:
+# 全局业务与监控配置：依赖仅做只读探测；每个应用单独设置管理端口。
 
 server:
   tomcat:
@@ -7,6 +7,10 @@ server:
     protocol-header: ${TOMCAT_PROTOCOL_HEADER:x-forwarded-proto}
 
 exchange:
+  monitoring:
+    dependencies-enabled: ${DEPENDENCY_MONITORING_ENABLED:true}
+    probe-interval-ms: ${DEPENDENCY_PROBE_INTERVAL_MS:15000}
+    dependencies: mysql,redis,kafka
   config:
     order-book-depth: ${ORDER_BOOK_DEPTH:50}
     debug-mode: ${EXCHANGE_DEBUG_MODE:false}
@@ -92,3 +96,29 @@ logging:
     root: ${LOGGING_ROOT_LEVEL:INFO}
     org.apache.kafka: ${LOGGING_KAFKA_LEVEL:WARN}
     com.itranswarp.exchange: ${LOGGING_EXCHANGE_LEVEL:INFO}
+
+# 不把外部共享依赖加入进程存活或本地就绪；聚合 health 另行包含 dependencies。
+management:
+  server:
+    address: ${MANAGEMENT_ADDRESS:0.0.0.0}
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState,application
+  health:
+    db:
+      # 数据库由后台缓存探测，避免每次健康查询同步访问连接池。
+      enabled: false
+  metrics:
+    tags:
+      application: ${spring.application.name}

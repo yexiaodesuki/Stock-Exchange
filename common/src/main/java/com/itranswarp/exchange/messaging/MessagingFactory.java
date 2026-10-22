@@ -1,9 +1,11 @@
+/* Kafka 工厂：观察调用、异步确认与真实消费者，不改变消息协议和 offset 策略。 */
 package com.itranswarp.exchange.messaging;
 
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Set;
+import java.util.Properties;
 import java.util.concurrent.ExecutionException;
 import java.util.regex.Pattern;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -32,6 +34,9 @@ import jakarta.annotation.PostConstruct;
  */
 @Component
 public class MessagingFactory extends LoggerSupport {
+
+    @Autowired
+    private com.itranswarp.exchange.monitoring.PipelineMonitoring monitoring = new com.itranswarp.exchange.monitoring.PipelineMonitoring();
 
     @Autowired
     private MessageTypes messageTypes;
@@ -68,25 +73,47 @@ public class MessagingFactory extends LoggerSupport {
         logger.info("init MessagingFactory ok.");
     }
 
+    /** 创建生产者适配器；发送不等待 broker，异步确认单独计数。 */
     public <T extends AbstractMessage> MessageProducer<T> createMessageProducer(Messaging.Topic topic,
             Class<T> messageClass) {
         logger.info("try create message producer for topic {}...", topic);
         final String name = topic.name();
         return new MessageProducer<>() {
+            /** 保留同步异常，完成回调只观察确认结果，不重发消息。 */
             @Override
             public void sendMessage(AbstractMessage message) {
-                kafkaTemplate.send(name, messageTypes.serialize(message));
+                long started = System.nanoTime();
+                try {
+                    kafkaTemplate.send(name, messageTypes.serialize(message)).whenComplete((result, error) -> {
+                        // 回调触发意味着 Kafka Future 已完成，不表示下游已经消费。
+                        monitoring.count("kafka_send_" + name, error == null ? "acknowledged" : "async_failure");
+                        monitoring.duration("kafka_send_" + name, started);
+                    });
+                    monitoring.count("kafka_send_" + name, "returned");
+                } catch (RuntimeException e) {
+                    monitoring.count("kafka_send_" + name, "sync_failure");
+                    monitoring.duration("kafka_send_" + name, started);
+                    throw e;
+                }
             }
         };
     }
 
+    /** 按默认错误处理与消费策略创建并启动批量消费者。 */
     public <T extends AbstractMessage> MessageConsumer createBatchMessageListener(Messaging.Topic topic, String groupId,
             BatchMessageHandler<T> messageHandler) {
         return createBatchMessageListener(topic, groupId, messageHandler, null);
     }
 
+    /** 保留原调用方式，不改变其他服务的消费策略。 */
     public <T extends AbstractMessage> MessageConsumer createBatchMessageListener(Messaging.Topic topic, String groupId,
             BatchMessageHandler<T> messageHandler, CommonErrorHandler errorHandler) {
+        return createBatchMessageListener(topic, groupId, messageHandler, errorHandler, null);
+    }
+
+    /** 创建批量消费者；可选重置策略只影响没有有效已提交位置的情况，不重置已有消费位置。 */
+    public <T extends AbstractMessage> MessageConsumer createBatchMessageListener(Messaging.Topic topic, String groupId,
+            BatchMessageHandler<T> messageHandler, CommonErrorHandler errorHandler, String autoOffsetReset) {
         logger.info("try create batch message listener for topic {}: group id = {}...", topic, groupId);
         ConcurrentMessageListenerContainer<String, String> listenerContainer = listenerContainerFactory
                 .createListenerContainer(new KafkaListenerEndpointAdapter() {
@@ -101,6 +128,7 @@ public class MessagingFactory extends LoggerSupport {
                     }
                 });
         listenerContainer.setupMessageListener(new BatchMessageListener<String, String>() {
+            /** 处理整批消息并观测返回或异常，保留原业务回调和 Kafka 错误处理器。 */
             @Override
             @SuppressWarnings("unchecked")
             public void onMessage(List<ConsumerRecord<String, String>> data) {
@@ -109,12 +137,27 @@ public class MessagingFactory extends LoggerSupport {
                     AbstractMessage message = messageTypes.deserialize(record.value());
                     messages.add((T) message);
                 }
-                messageHandler.processMessages(messages);
+                long started = System.nanoTime();
+                try {
+                    messageHandler.processMessages(messages);
+                    monitoring.count("kafka_consume_" + topic.name(), "success", messages.size());
+                } catch (RuntimeException | Error e) {
+                    monitoring.count("kafka_consume_" + topic.name(), "failure");
+                    throw e;
+                } finally {
+                    monitoring.duration("kafka_consume_" + topic.name(), started);
+                }
             }
         });
         if (errorHandler != null) {
             listenerContainer.setCommonErrorHandler(errorHandler);
         }
+        if (autoOffsetReset != null) {
+            Properties overrides = new Properties();
+            overrides.setProperty("auto.offset.reset", autoOffsetReset);
+            listenerContainer.getContainerProperties().setKafkaConsumerProperties(overrides);
+        }
+        monitoring.component("consumer_" + topic.name(), listenerContainer::isRunning);
         listenerContainer.start();
         return listenerContainer::stop;
     }

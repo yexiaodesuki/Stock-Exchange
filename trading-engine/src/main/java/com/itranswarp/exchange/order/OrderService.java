@@ -1,3 +1,4 @@
+/* 活动订单服务：实时下单冻结资产；快照恢复仅重建索引，不重复冻结或撮合。 */
 package com.itranswarp.exchange.order;
 
 import java.math.BigDecimal;
@@ -73,6 +74,14 @@ public class OrderService {
 
     public ConcurrentMap<Long, OrderEntity> getActiveOrders() {
         return this.activeOrders;
+    }
+
+    /** 在恢复阶段直接登记已校验的活动订单，各索引共享同一对象；不执行资金操作。 */
+    public void restoreOrder(OrderEntity order) {
+        if (this.activeOrders.putIfAbsent(order.id, order) != null) {
+            throw new IllegalArgumentException("快照活动订单 ID 重复");
+        }
+        this.userOrders.computeIfAbsent(order.userId, user -> new ConcurrentHashMap<>()).put(order.id, order);
     }
 
     public OrderEntity getOrder(Long orderId) {

@@ -1,3 +1,8 @@
+# 本项目的 Git 忽略规则：排除本地协作规范、构建产物及敏感配置。
+
+# 本地协作规范，仅保留在本机
+/AGENTS.md
+
 # Java / Maven
 target/
 *.class

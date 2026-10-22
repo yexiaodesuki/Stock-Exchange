@@ -1,3 +1,4 @@
+/* Kafka 工厂：原生指标随客户端创建和关闭绑定，不改变消费策略。 */
 package com.itranswarp.exchange.messaging;
 
 import java.util.HashMap;
@@ -54,11 +55,15 @@ public class MessagingConfiguration {
         return new KafkaAdmin(configs);
     }
 
+    /** 绑定原生生产者指标，保留原有生产者参数。 */
     @Bean
     public ProducerFactory<String, String> producerFactory(
-            @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers) {
+            @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers,
+            org.springframework.beans.factory.ObjectProvider<io.micrometer.core.instrument.MeterRegistry> registries) {
         logger.info("init kafka producer from bootstrap servers: {}", bootstrapServers);
-        return new DefaultKafkaProducerFactory<>(producerConfigs(bootstrapServers));
+        DefaultKafkaProducerFactory<String, String> factory = new DefaultKafkaProducerFactory<>(producerConfigs(bootstrapServers));
+        registries.ifAvailable(registry -> factory.addListener(new org.springframework.kafka.core.MicrometerProducerListener<>(registry)));
+        return factory;
     }
 
     @Bean
@@ -67,13 +72,17 @@ public class MessagingConfiguration {
         return new KafkaTemplate<>(producerFactory);
     }
 
+    /** 绑定真实客户端分区 lag 等指标，不将其解释为业务执行位置。 */
     @Bean
     public ConsumerFactory<String, String> consumerFactory(
             @Value("${spring.kafka.bootstrap-servers}") String bootstrapServers,
-            @Value("${spring.kafka.consumer.max-poll-records}") int batchSize) {
+            @Value("${spring.kafka.consumer.max-poll-records}") int batchSize,
+            org.springframework.beans.factory.ObjectProvider<io.micrometer.core.instrument.MeterRegistry> registries) {
         logger.info("init kafka consumer from bootstrap servers: {}, batch-size: {}", bootstrapServers,
                 Integer.valueOf(batchSize));
-        return new DefaultKafkaConsumerFactory<>(consumerConfigs(bootstrapServers, batchSize));
+        DefaultKafkaConsumerFactory<String, String> factory = new DefaultKafkaConsumerFactory<>(consumerConfigs(bootstrapServers, batchSize));
+        registries.ifAvailable(registry -> factory.addListener(new org.springframework.kafka.core.MicrometerConsumerListener<>(registry)));
+        return factory;
     }
 
     @Bean

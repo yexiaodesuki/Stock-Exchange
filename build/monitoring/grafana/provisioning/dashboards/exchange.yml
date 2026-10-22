@@ -1,0 +1,11 @@
+# 启动自动导入交易引擎仪表盘；修改版本库文件而非在界面覆盖预置配置。
+apiVersion: 1
+providers:
+  - name: exchange
+    folder: Stock Exchange
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

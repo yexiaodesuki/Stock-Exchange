@@ -1,4 +1,8 @@
-# push:
+# Push 仍使用 Vert.x；以下管理参数由独立 Vert.x 管理监听器读取。
 
 server:
   port: ${APP_PORT:8006}
+
+management:
+  server:
+    port: ${PUSH_MANAGEMENT_PORT:18006}

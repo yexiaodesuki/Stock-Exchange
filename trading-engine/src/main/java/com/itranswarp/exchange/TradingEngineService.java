@@ -1,3 +1,7 @@
+/*
+ * 交易引擎协调资产、订单、撮合与清算；历史重放复用状态逻辑，但隔离所有对外输出。
+ * 启动恢复校验通过后才创建消费者和输出线程；快照在完整事件边界复制，不包含对外输出队列。
+ */
 package com.itranswarp.exchange;
 
 import java.math.BigDecimal;
@@ -10,10 +14,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
-import jakarta.annotation.PostConstruct;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Comparator;
 import jakarta.annotation.PreDestroy;
+import jakarta.annotation.PostConstruct;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -50,12 +55,32 @@ import com.itranswarp.exchange.order.OrderService;
 import com.itranswarp.exchange.redis.RedisCache;
 import com.itranswarp.exchange.redis.RedisService;
 import com.itranswarp.exchange.store.StoreService;
+import com.itranswarp.exchange.snapshot.EngineSnapshot;
+import com.itranswarp.exchange.monitoring.EngineMonitoringService;
+import com.itranswarp.exchange.monitoring.EngineMonitoringService.Output;
+import com.itranswarp.exchange.monitoring.PendingQueue;
 import com.itranswarp.exchange.support.LoggerSupport;
 import com.itranswarp.exchange.util.IpUtil;
 import com.itranswarp.exchange.util.JsonUtil;
 
 @Component
 public class TradingEngineService extends LoggerSupport {
+
+    @Autowired
+    EngineMonitoringService monitoring = new EngineMonitoringService();
+
+    /** Spring 注入注册表后绑定常数时间队列指标；不启动任何业务线程或网络请求。 */
+    @PostConstruct
+    public void bindMonitoring() {
+        monitoring.bindQueue("orders", orderQueue);
+        monitoring.bindQueue("matches", matchQueue);
+        monitoring.bindQueue("ticks", tickQueue);
+        monitoring.bindQueue("api_results", apiResultQueue);
+        monitoring.bindQueue("notifications", notificationQueue);
+    }
+
+    /** 为恢复和快照协调器共享同一监控状态；返回不需要取得引擎锁。 */
+    public EngineMonitoringService getMonitoring() { return monitoring; }
 
     @Autowired(required = false)
     ZoneId zoneId = ZoneId.systemDefault();
@@ -66,7 +91,15 @@ public class TradingEngineService extends LoggerSupport {
     @Value("#{exchangeConfiguration.debugMode}")
     boolean debugMode = false;
 
-    boolean fatalError = false;
+    volatile boolean fatalError = false;
+
+    /** volatile 保证 HTTP 线程能看到恢复进度，不用等待耗时的恢复锁。 */
+    private volatile RecoveryState recoveryState = RecoveryState.RECOVERING;
+
+    private boolean recoveryStarted;
+
+    /** 就绪描述的是恢复已完成且实时入口已启动，不替代 Kafka 或 Redis 持续健康监测。 */
+    public enum RecoveryState { RECOVERING, READY, FAILED, STOPPED }
 
     @Autowired
     AssetService assetService;
@@ -105,41 +138,127 @@ public class TradingEngineService extends LoggerSupport {
     private Thread orderBookThread;
     private Thread dbThread;
 
-    private OrderBookBean latestOrderBook = null;
-    private Queue<List<OrderEntity>> orderQueue = new ConcurrentLinkedQueue<>();
-    private Queue<List<MatchDetailEntity>> matchQueue = new ConcurrentLinkedQueue<>();
-    private Queue<TickMessage> tickQueue = new ConcurrentLinkedQueue<>();
-    private Queue<ApiResultMessage> apiResultQueue = new ConcurrentLinkedQueue<>();
-    private Queue<NotificationMessage> notificationQueue = new ConcurrentLinkedQueue<>();
+    private volatile OrderBookBean latestOrderBook = null;
+    private Queue<List<OrderEntity>> orderQueue = new PendingQueue<>();
+    private Queue<List<MatchDetailEntity>> matchQueue = new PendingQueue<>();
+    private Queue<TickMessage> tickQueue = new PendingQueue<>();
+    private Queue<ApiResultMessage> apiResultQueue = new PendingQueue<>();
+    private Queue<NotificationMessage> notificationQueue = new PendingQueue<>();
 
-    @PostConstruct
-    public void init() {
-        this.shaUpdateOrderBookLua = this.redisService.loadScriptFromClassPath("/redis/update-orderbook.lua");
-        this.consumer = this.messagingFactory.createBatchMessageListener(Messaging.Topic.TRADE, IpUtil.getHostId(),
-                this::processMessages);
-        this.producer = this.messagingFactory.createMessageProducer(Topic.TICK, TickMessage.class);
-        this.tickThread = new Thread(this::runTickThread, "async-tick");
-        this.tickThread.start();
-        this.notifyThread = new Thread(this::runNotifyThread, "async-notify");
-        this.notifyThread.start();
-        this.orderBookThread = new Thread(this::runOrderBookThread, "async-orderbook");
-        this.orderBookThread.start();
-        this.apiResultThread = new Thread(this::runApiResultThread, "async-api-result");
-        this.apiResultThread.start();
-        this.dbThread = new Thread(this::runDbThread, "async-db");
-        this.dbThread.start();
+    /** 只允许新引擎开始一次恢复，不允许在线清空或覆盖已经处理的状态。 */
+    public synchronized void beginRecovery() {
+        if (recoveryState != RecoveryState.RECOVERING || recoveryStarted || fatalError || lastSequenceId != 0) {
+            throw new IllegalStateException("引擎不是可恢复的新状态");
+        }
+        this.recoveryStarted = true;
+        monitoring.state("RECOVERING");
     }
 
+    /** 恢复后发布一次当前盘口，再启动实时消费；任意初始化失败由恢复协调器清理。 */
+    public synchronized void startAfterRecovery() {
+        if (recoveryState != RecoveryState.RECOVERING || !recoveryStarted || fatalError) {
+            throw new IllegalStateException("不能开放未成功恢复的引擎");
+        }
+        this.shaUpdateOrderBookLua = this.redisService.loadScriptFromClassPath("/redis/update-orderbook.lua");
+        OrderBookBean book = currentOrderBook();
+        Boolean published = this.redisService.executeScriptReturnBoolean(this.shaUpdateOrderBookLua,
+                new String[] { RedisCache.Key.ORDER_BOOK },
+                new String[] { String.valueOf(book.sequenceId), JsonUtil.writeJson(book), "restore" });
+        if (!Boolean.TRUE.equals(published)) {
+            throw new IllegalStateException("Redis 盘口位置领先于恢复位置，拒绝开放可能过期的引擎");
+        }
+        this.producer = this.messagingFactory.createMessageProducer(Topic.TICK, TickMessage.class);
+        this.tickThread = newOutputThread(Output.TICK, this::runTickThread, "async-tick");
+        this.tickThread.start();
+        this.notifyThread = newOutputThread(Output.NOTIFY, this::runNotifyThread, "async-notify");
+        this.notifyThread.start();
+        this.orderBookThread = newOutputThread(Output.ORDERBOOK, this::runOrderBookThread, "async-orderbook");
+        this.orderBookThread.start();
+        this.apiResultThread = newOutputThread(Output.API_RESULT, this::runApiResultThread, "async-api-result");
+        this.apiResultThread.start();
+        this.dbThread = newOutputThread(Output.DB, this::runDbThread, "async-db");
+        this.dbThread.start();
+        // earliest 只用于没有有效消费位置时；启动窗口内的新事件不能从 latest 开始而被跳过。
+        this.consumer = this.messagingFactory.createBatchMessageListener(Messaging.Topic.TRADE, IpUtil.getHostId(),
+                this::onTradeMessages, null, "earliest");
+        this.recoveryState = RecoveryState.READY;
+        monitoring.expectWorkers(true);
+        monitoring.state("READY");
+    }
+
+    /** 包装输出线程以观察异常退出，保留原异常和退出行为，不添加自动重试。 */
+    private Thread newOutputThread(Output output, Runnable action, String name) {
+        // 回调只捕获未处理故障；正常中断或停机不增加失败计数。
+        Thread thread = new Thread(() -> {
+            try {
+                action.run();
+            } catch (RuntimeException | Error e) {
+                if (recoveryState != RecoveryState.STOPPED) monitoring.outputFailed(output);
+                throw e;
+            }
+        }, name);
+        monitoring.bindWorker(output, thread);
+        return thread;
+    }
+
+    /** 查询可见的生命周期状态；致命错误即使尚未清理线程也不得报告就绪。 */
+    public RecoveryState getRecoveryState() {
+        return fatalError ? RecoveryState.FAILED : recoveryState;
+    }
+
+    /** 业务入口快速拒绝恢复中、失败或停止状态，不返回半恢复的空资产。 */
+    public void requireReady() {
+        RecoveryState state = getRecoveryState();
+        if (state != RecoveryState.READY) {
+            throw new ApiException(ApiError.ENGINE_UNAVAILABLE, state.name(), "交易引擎尚未就绪，请稍后重试");
+        }
+    }
+
+    /** 恢复失败后关闭已创建的资源；不回滚已应用的内存事件，必须重建引擎再恢复。 */
+    public void failRecovery() {
+        this.fatalError = true;
+        this.recoveryState = RecoveryState.FAILED;
+        monitoring.state("FAILED");
+        monitoring.expectWorkers(false);
+        stopResources();
+    }
+
+    /** 关闭业务入口和所有输出线程，兼容恢复尚未创建消费者时的清理。 */
     @PreDestroy
     public void destroy() {
-        this.consumer.stop();
-        this.orderBookThread.interrupt();
-        this.dbThread.interrupt();
+        this.recoveryState = RecoveryState.STOPPED;
+        monitoring.state("STOPPED");
+        monitoring.expectWorkers(false);
+        stopResources();
     }
 
+    /** 逐个清理已创建的资源，避免某个资源关闭失败阻止其余线程收到退出信号。 */
+    private void stopResources() {
+        if (this.consumer != null) {
+            try {
+                this.consumer.stop();
+            } catch (Exception e) {
+                logger.warn("停止交易消费者失败", e);
+            }
+        }
+        for (Thread thread : new Thread[] { tickThread, notifyThread, apiResultThread, orderBookThread, dbThread }) {
+            if (thread != null) {
+                thread.interrupt();
+            }
+        }
+    }
+
+    /** 盘口发布位置使用引擎已应用序号，使撤单也能推进 Redis 版本而不是沿用最后下单序号。 */
+    private OrderBookBean currentOrderBook() {
+        OrderBookBean book = this.matchEngine.getOrderBook(this.orderBookDepth);
+        book.sequenceId = this.lastSequenceId;
+        return book;
+    }
+
+    /** 从实时队列发送 Tick 并统计调用正常返回；不等待 broker 确认，不负责历史补偿。 */
     private void runTickThread() {
         logger.info("start tick thread...");
-        for (;;) {
+        while (!Thread.currentThread().isInterrupted()) {
             List<TickMessage> msgs = new ArrayList<>();
             for (;;) {
                 TickMessage msg = tickQueue.poll();
@@ -157,6 +276,7 @@ public class TradingEngineService extends LoggerSupport {
                     logger.debug("send {} tick messages...", msgs.size());
                 }
                 this.producer.sendMessages(msgs);
+                monitoring.tickSendReturned();
             } else {
                 // 无TickMessage时，暂停1ms:
                 try {
@@ -169,9 +289,10 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
+    /** 发布实时私人通知，恢复期间不会生成这些任务。 */
     private void runNotifyThread() {
         logger.info("start publish notify to redis...");
-        for (;;) {
+        while (!Thread.currentThread().isInterrupted()) {
             NotificationMessage msg = this.notificationQueue.poll();
             if (msg != null) {
                 redisService.publish(RedisCache.Topic.NOTIFICATION, JsonUtil.writeJson(msg));
@@ -187,9 +308,10 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
+    /** 发布实时异步请求结果，线程关闭时不再接收新输出。 */
     private void runApiResultThread() {
         logger.info("start publish api result to redis...");
-        for (;;) {
+        while (!Thread.currentThread().isInterrupted()) {
             ApiResultMessage result = this.apiResultQueue.poll();
             if (result != null) {
                 redisService.publish(RedisCache.Topic.TRADING_API_RESULT, JsonUtil.writeJson(result));
@@ -205,10 +327,11 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
+    /** 发布已完成事件边界上的最新盘口；以 volatile 引用保证跨线程可见性。 */
     private void runOrderBookThread() {
         logger.info("start update orderbook snapshot to redis...");
         long lastSequenceId = 0;
-        for (;;) {
+        while (!Thread.currentThread().isInterrupted()) {
             // 获取OrderBookBean的引用，确保后续操作针对局部变量而非成员变量:
             final OrderBookBean orderBook = this.latestOrderBook;
             // 仅在OrderBookBean更新后刷新Redis:
@@ -234,9 +357,10 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
+    /** 消费实时历史投影任务；关闭时退出，持久化输出可靠性不在本阶段补偿。 */
     private void runDbThread() {
         logger.info("start batch insert to db...");
-        for (;;) {
+        while (!Thread.currentThread().isInterrupted()) {
             try {
                 saveToDb();
             } catch (InterruptedException e) {
@@ -291,24 +415,160 @@ public class TradingEngineService extends LoggerSupport {
         }
     }
 
-    public void processMessages(List<AbstractEvent> messages) {
+    /** Kafka 回调在初始化锁释放后检查就绪，再接入实时处理，禁止恢复期间修改状态。 */
+    private synchronized void onTradeMessages(List<AbstractEvent> messages) {
+        requireReady();
+        processMessages(messages);
+    }
+
+    /** 串行执行实时批次，并仅为实时事件生成供 Redis 输出线程使用的盘口快照。 */
+    public synchronized void processMessages(List<AbstractEvent> messages) {
         this.orderBookChanged = false;
         for (AbstractEvent message : messages) {
             processEvent(message);
         }
         if (this.orderBookChanged) {
             // 获取最新的OrderBook快照:
-            this.latestOrderBook = this.matchEngine.getOrderBook(this.orderBookDepth);
+            this.latestOrderBook = currentOrderBook();
         }
     }
 
-    public void processEvent(AbstractEvent event) {
+    /** 执行一个实时事件，保留现有缺口补读和异步输出行为。 */
+    public synchronized void processEvent(AbstractEvent event) {
+        executeEvent(event, EventExecutionMode.LIVE);
+    }
+
+    /**
+     * 按输入顺序重放已定序的历史事件，仅重建状态和已应用序号。
+     * 不访问数据库补读，不生成旧通知、行情、HTTP 结果或历史写入任务。
+     * 与实时入口使用同一锁；断链或执行失败会标记引擎失败并抛异常，调用者不得继续开放服务。
+     * 此方法不清空既有状态，也不保证整批回滚，应由后续恢复协调器在新状态上调用。
+     */
+    public synchronized void replayEvents(List<AbstractEvent> events) {
+        if (this.fatalError) {
+            throw new IllegalStateException("交易引擎已失败，不能继续重放");
+        }
+        for (AbstractEvent event : events) {
+            executeEvent(event, EventExecutionMode.REPLAY);
+        }
+    }
+
+    /** 返回已完整执行的事件序号；该值不是 Kafka 消费位置或数据库最大序号。 */
+    public synchronized long getLastSequenceId() {
+        return this.lastSequenceId;
+    }
+
+    /** 返回恢复使用的固定时区；时区影响订单 ID，不能在快照恢复时悄悄更换。 */
+    public String getSnapshotZoneId() {
+        return this.zoneId.getId();
+    }
+
+    /** 在同一事件锁内校验并取得独立不可变状态；调用者在锁外序列化和写数据库。 */
+    public synchronized EngineSnapshot captureSnapshot() {
+        if (fatalError || recoveryState == RecoveryState.FAILED || recoveryState == RecoveryState.STOPPED) {
+            throw new IllegalStateException("不能对失败或停止的引擎生成快照");
+        }
+        validate();
+        List<EngineSnapshot.AssetState> assets = new ArrayList<>();
+        this.assetService.getUserAssets().forEach((user, balances) -> balances.forEach((asset, balance) ->
+                assets.add(new EngineSnapshot.AssetState(user, asset, balance.getAvailable(), balance.getFrozen()))));
+        assets.sort(Comparator.comparingLong(EngineSnapshot.AssetState::userId)
+                .thenComparing(EngineSnapshot.AssetState::asset));
+        List<EngineSnapshot.OrderState> orders = this.orderService.getActiveOrders().values().stream()
+                .sorted(Comparator.comparingLong(order -> order.sequenceId))
+                .map(EngineSnapshot.OrderState::from).toList();
+        EngineSnapshot snapshot = new EngineSnapshot(EngineSnapshot.FORMAT_VERSION, lastSequenceId,
+                zoneId.getId(), matchEngine.marketPrice, assets, orders);
+        snapshot.validateShape();
+        return snapshot;
+    }
+
+    /**
+     * 仅在启动恢复的新状态安装快照。先在独立候选中校验，失败不会污染真实状态。
+     * 安装时保留 Spring 注入的组件对象，避免控制器仍引用旧组件；全局、用户和盘口共享订单。
+     */
+    public synchronized void restoreSnapshot(EngineSnapshot snapshot) {
+        if (!recoveryStarted || recoveryState != RecoveryState.RECOVERING || fatalError || lastSequenceId != 0
+                || !assetService.getUserAssets().isEmpty() || !orderService.getActiveOrders().isEmpty()
+                || !matchEngine.buyBook.book.isEmpty() || !matchEngine.sellBook.book.isEmpty()) {
+            throw new IllegalStateException("快照只能安装到启动恢复的新状态");
+        }
+        snapshot.validateShape();
+        if (!zoneId.getId().equals(snapshot.zoneId())) {
+            throw new IllegalStateException("快照时区与引擎配置不同，禁止改变订单标识语义");
+        }
+        TradingEngineService candidate = new TradingEngineService();
+        candidate.assetService = new AssetService();
+        candidate.orderService = new OrderService(candidate.assetService);
+        candidate.matchEngine = new MatchEngine();
+        for (EngineSnapshot.AssetState asset : snapshot.assets()) {
+            candidate.assetService.getUserAssets().computeIfAbsent(asset.userId(), user -> new ConcurrentHashMap<>())
+                    .put(asset.asset(), new Asset(asset.available(), asset.frozen()));
+        }
+        for (EngineSnapshot.OrderState data : snapshot.orders()) {
+            OrderEntity order = data.toOrder();
+            candidate.orderService.restoreOrder(order);
+            if (!(order.direction == Direction.BUY ? candidate.matchEngine.buyBook : candidate.matchEngine.sellBook)
+                    .add(order)) {
+                throw new IllegalArgumentException("快照订单簿优先级重复");
+            }
+        }
+        candidate.matchEngine.marketPrice = snapshot.marketPrice();
+        try {
+            candidate.validate();
+            OrderEntity buy = candidate.matchEngine.buyBook.getFirst();
+            OrderEntity sell = candidate.matchEngine.sellBook.getFirst();
+            if (buy != null && sell != null && buy.price.compareTo(sell.price) >= 0) {
+                throw new IllegalStateException("快照包含尚未撮合的交叉盘口");
+            }
+        } catch (IllegalStateException e) {
+            throw new IllegalArgumentException("快照业务状态不一致", e);
+        }
+        this.assetService.getUserAssets().putAll(candidate.assetService.getUserAssets());
+        for (OrderEntity order : candidate.orderService.getActiveOrders().values()) {
+            this.orderService.restoreOrder(order);
+        }
+        this.matchEngine.buyBook.book.putAll(candidate.matchEngine.buyBook.book);
+        this.matchEngine.sellBook.book.putAll(candidate.matchEngine.sellBook.book);
+        this.matchEngine.marketPrice = snapshot.marketPrice();
+        this.lastSequenceId = snapshot.sequenceId();
+        monitoring.applied(this.lastSequenceId);
+    }
+
+    /** 统计完整执行、重复和失败；缺口补读仅统计实际执行的子事件，避免重复计数。 */
+    private void executeEvent(AbstractEvent event, EventExecutionMode mode) {
+        if (fatalError) return;
+        long previous = lastSequenceId;
+        boolean gap = mode == EventExecutionMode.LIVE && event.sequenceId > previous && event.previousId > previous;
+        long start = System.nanoTime();
+        boolean failed = false;
+        try {
+            applyEvent(event, mode);
+        } catch (RuntimeException | Error e) {
+            failed = true;
+            monitoring.state("FAILED");
+            throw e;
+        } finally {
+            if (!gap) {
+                String result = failed || fatalError ? "failure" : event.sequenceId <= previous ? "duplicate" : "applied";
+                monitoring.event(mode == EventExecutionMode.LIVE ? "live" : "replay", result, start);
+            }
+        }
+    }
+
+    /** 保留原有顺序检查与状态分发，执行模式只控制输出和重放失败行为。 */
+    private void applyEvent(AbstractEvent event, EventExecutionMode mode) {
         if (this.fatalError) {
             return;
         }
         if (event.sequenceId <= this.lastSequenceId) {
             logger.warn("skip duplicate event: {}", event);
             return;
+        }
+        if (mode == EventExecutionMode.REPLAY && event.previousId != this.lastSequenceId) {
+            this.fatalError = true;
+            throw new IllegalStateException("历史事件断链：期望 previousId=" + this.lastSequenceId
+                    + "，实际 previousId=" + event.previousId);
         }
         if (event.previousId > this.lastSequenceId) {
             logger.warn("event lost: expected previous id {} but actual {} for event {}", this.lastSequenceId,
@@ -320,7 +580,7 @@ public class TradingEngineService extends LoggerSupport {
                 return;
             }
             for (AbstractEvent e : events) {
-                this.processEvent(e);
+                executeEvent(e, mode);
             }
             return;
         }
@@ -335,34 +595,46 @@ public class TradingEngineService extends LoggerSupport {
         }
         try {
             if (event instanceof OrderRequestEvent) {
-                createOrder((OrderRequestEvent) event);
+                createOrder((OrderRequestEvent) event, mode);
             } else if (event instanceof OrderCancelEvent) {
-                cancelOrder((OrderCancelEvent) event);
+                cancelOrder((OrderCancelEvent) event, mode);
             } else if (event instanceof TransferEvent) {
                 transfer((TransferEvent) event);
             } else {
+                if (mode == EventExecutionMode.REPLAY) {
+                    throw new IllegalArgumentException("不支持的历史事件类型：" + event.getClass().getName());
+                }
                 logger.error("unable to process event type: {}", event.getClass().getName());
                 panic();
                 return;
             }
+            if (debugMode) {
+                this.validate();
+            }
         } catch (Exception e) {
+            if (mode == EventExecutionMode.REPLAY) {
+                this.fatalError = true;
+                throw new IllegalStateException("历史事件执行失败，sequenceId=" + event.sequenceId, e);
+            }
             logger.error("process event error.", e);
             panic();
             return;
         }
         this.lastSequenceId = event.sequenceId;
+        monitoring.applied(this.lastSequenceId);
         if (logger.isDebugEnabled()) {
             logger.debug("set last processed sequence id: {}...", this.lastSequenceId);
         }
         if (debugMode) {
-            this.validate();
             this.debug();
         }
     }
 
+    /** 保留实时致命故障退出行为，退出前记录失败状态，监控不修复交易状态。 */
     private void panic() {
         logger.error("application panic. exit now...");
         this.fatalError = true;
+        monitoring.state("FAILED");
         System.exit(1);
     }
 
@@ -372,7 +644,8 @@ public class TradingEngineService extends LoggerSupport {
         return ok;
     }
 
-    void createOrder(OrderRequestEvent event) {
+    /** 共用下单、冻结、撮合和清算；重放完成状态变更后立即返回，不创建输出任务。 */
+    private void createOrder(OrderRequestEvent event, EventExecutionMode mode) {
         ZonedDateTime zdt = Instant.ofEpochMilli(event.createdAt).atZone(zoneId);
         int year = zdt.getYear();
         int month = zdt.getMonth().getValue();
@@ -382,11 +655,21 @@ public class TradingEngineService extends LoggerSupport {
         if (order == null) {
             logger.warn("create order failed.");
             // 推送失败结果:
-            this.apiResultQueue.add(ApiResultMessage.createOrderFailed(event.refId, event.createdAt));
+            if (mode == EventExecutionMode.LIVE) {
+                this.apiResultQueue.add(ApiResultMessage.createOrderFailed(event.refId, event.createdAt));
+            }
             return;
         }
         MatchResult result = this.matchEngine.processOrder(event.sequenceId, order);
         this.clearingService.clearMatchResult(result);
+        if (mode == EventExecutionMode.REPLAY) {
+            return;
+        }
+        publishOrderResult(event, order, result);
+    }
+
+    /** 为实时订单收集 HTTP 结果、成交通知、Tick 和历史投影；重放不进入此方法。 */
+    private void publishOrderResult(OrderRequestEvent event, OrderEntity order, MatchResult result) {
         // 推送成功结果,注意必须复制一份OrderEntity,因为将异步序列化:
         this.apiResultQueue.add(ApiResultMessage.orderSuccess(event.refId, order.copy(), event.createdAt));
         this.orderBookChanged = true;
@@ -462,16 +745,22 @@ public class TradingEngineService extends LoggerSupport {
         return d;
     }
 
-    void cancelOrder(OrderCancelEvent event) {
+    /** 共用撤单和解冻逻辑；重放不产生成功或失败响应，也不触发盘口发布。 */
+    private void cancelOrder(OrderCancelEvent event, EventExecutionMode mode) {
         OrderEntity order = this.orderService.getOrder(event.refOrderId);
         // 未找到活动订单或订单不属于该用户:
         if (order == null || order.userId.longValue() != event.userId.longValue()) {
             // 发送失败消息:
-            this.apiResultQueue.add(ApiResultMessage.cancelOrderFailed(event.refId, event.createdAt));
+            if (mode == EventExecutionMode.LIVE) {
+                this.apiResultQueue.add(ApiResultMessage.cancelOrderFailed(event.refId, event.createdAt));
+            }
             return;
         }
         this.matchEngine.cancel(event.createdAt, order);
         this.clearingService.clearCancelOrder(order);
+        if (mode == EventExecutionMode.REPLAY) {
+            return;
+        }
         this.orderBookChanged = true;
         // 发送成功消息:
         this.apiResultQueue.add(ApiResultMessage.orderSuccess(event.refId, order, event.createdAt));
@@ -602,10 +891,11 @@ public class TradingEngineService extends LoggerSupport {
         require(copyOfActiveOrders.isEmpty(), "Not all active orders are in order book.");
     }
 
+    /** 校验失败抛出异常，由事件入口决定实时停机或重放失败，不在校验内部退出进程。 */
     void require(boolean condition, String errorMessage) {
         if (!condition) {
             logger.error("validate failed: {}", errorMessage);
-            panic();
+            throw new IllegalStateException("交易状态校验失败：" + errorMessage);
         }
     }
 }

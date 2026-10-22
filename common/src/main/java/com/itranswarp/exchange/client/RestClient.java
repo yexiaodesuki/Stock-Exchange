@@ -1,3 +1,4 @@
+/* HTTP 客户端：解析业务错误，并保留引擎不可用的 503 语义供 UI 代理传递。 */
 package com.itranswarp.exchange.client;
 
 import java.io.IOException;
@@ -180,6 +181,7 @@ public class RestClient {
         }
     }
 
+    /** 执行 HTTP 请求；400/503 均读取共享错误体，其他非成功响应维持原错误处理。 */
     @SuppressWarnings("unchecked")
     <T> T execute(Class<T> clazz, TypeReference<T> ref, Request request) throws IOException {
         logger.info("request: {}...", request.url().url());
@@ -198,7 +200,7 @@ public class RestClient {
                     }
                     return objectMapper.readValue(json, clazz);
                 }
-            } else if (response.code() == 400) {
+            } else if (response.code() == 400 || response.code() == 503) {
                 try (ResponseBody body = response.body()) {
                     String bodyString = body.string();
                     logger.warn("response 400. error: " + bodyString);

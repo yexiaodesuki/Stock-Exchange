@@ -1,6 +1,8 @@
+/* 引擎 HTTP 代理：统一观测所有显式就绪检查，保留不可达和恢复中的 503 语义。 */
 package com.itranswarp.exchange.service;
 
 import java.io.IOException;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import org.springframework.beans.factory.annotation.Value;
@@ -8,6 +10,7 @@ import org.springframework.stereotype.Component;
 
 import com.itranswarp.exchange.ApiError;
 import com.itranswarp.exchange.ApiException;
+import com.itranswarp.exchange.util.JsonUtil;
 import com.itranswarp.exchange.support.LoggerSupport;
 import okhttp3.ConnectionPool;
 import okhttp3.OkHttpClient;
@@ -20,6 +23,9 @@ import okhttp3.ResponseBody;
  */
 @Component
 public class TradingEngineApiProxyService extends LoggerSupport {
+
+    @org.springframework.beans.factory.annotation.Autowired
+    private com.itranswarp.exchange.monitoring.PipelineMonitoring monitoring = new com.itranswarp.exchange.monitoring.PipelineMonitoring();
 
     @Value("#{exchangeConfiguration.apiEndpoints.tradingEngineApi}")
     private String tradingEngineInternalApiEndpoint;
@@ -34,10 +40,31 @@ public class TradingEngineApiProxyService extends LoggerSupport {
             // do not retry:
             .retryOnConnectionFailure(false).build();
 
+    /** 统一观测控制器及发送入口的就绪检查，不改变超时、重试或 503 语义。 */
+    public void requireReady() {
+        long started = System.nanoTime();
+        try {
+            Map<?, ?> status = JsonUtil.readJson(get("/internal/status"), Map.class);
+            if (!Boolean.TRUE.equals(status.get("ready"))) {
+                throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎尚未就绪");
+            }
+            monitoring.count("engine_gate", "success");
+        } catch (IOException | RuntimeException e) {
+            monitoring.count("engine_gate", "failure");
+            throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎未就绪或探针失败，请稍后重试");
+        } finally {
+            monitoring.duration("engine_gate", started);
+        }
+    }
+
+    /** 转发查询；引擎 503 或连接失败均明确不可用，其余非成功状态保持原业务错误处理。 */
     public String get(String url) throws IOException {
         Request request = new Request.Builder().url(tradingEngineInternalApiEndpoint + url).header("Accept", "*/*")
                 .build();
         try (Response response = okhttpClient.newCall(request).execute()) {
+            if (response.code() == 503) {
+                throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎尚未就绪，请稍后重试");
+            }
             if (response.code() != 200) {
                 logger.error("Internal api failed with code {}: {}", Integer.valueOf(response.code()), url);
                 throw new ApiException(ApiError.OPERATION_TIMEOUT, null, "operation timeout.");
@@ -50,6 +77,8 @@ public class TradingEngineApiProxyService extends LoggerSupport {
                 }
                 return json;
             }
+        } catch (IOException e) {
+            throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎不可达，请稍后重试");
         }
     }
 }
