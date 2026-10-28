@@ -2,6 +2,8 @@
 
 # 本地协作规范，仅保留在本机
 /AGENTS.md
+/.codex/
+/.agents/
 
 # Java / Maven
 target/
@@ -10,6 +12,16 @@ target/
 *.ear
 hs_err_pid*
 replay_pid*
+*.hprof
+*.jfr
+dependency-reduced-pom.xml
+.flattened-pom.xml
+pom.xml.versionsBackup
+pom.xml.releaseBackup
+pom.xml.next
+pom.xml.tag
+release.properties
+.m2/
 
 # IDEA
 .idea/
@@ -17,15 +29,24 @@ replay_pid*
 *.ipr
 *.iws
 out/
+.classpath
+.project
+.settings/
+.vscode/
 
 # Logs
 logs/
 *.log
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # Local secrets
 .env
 .env.*
 !.env.example
+!build/.env.securities.example
 application-local.yml
 application-local.yaml
 *.key
@@ -34,12 +55,33 @@ application-local.yaml
 *.jks
 
 # Local runtime data
+/build/.local-run/
 mysql-data/
 redis-data/
 kafka-data/
+grafana-data/
+prometheus-data/
+/backups/
 
 # Frontend dependencies
 node_modules/
+.npm/
+.cache/
+.parcel-cache/
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+blob-report/
+/ui/dist/
+
+# 编辑器临时文件；不全局忽略 SQL、JSON、图片或业务 output 包
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
 
 # Operating system
 .DS_Store

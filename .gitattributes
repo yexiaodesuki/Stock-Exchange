@@ -1,0 +1,4 @@
+# 容器脚本和迁移在 Windows/Linux 上保持一致，避免 CRLF 令 Bash 失败。
+*.sh text eol=lf
+*.sql text eol=lf
+*.yml text eol=lf

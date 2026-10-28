@@ -1,0 +1,9 @@
+# 证券版监控数据源；不导入只适用于旧引擎的仪表盘。
+apiVersion: 1
+datasources:
+  - name: Exchange Prometheus
+    uid: exchange-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true

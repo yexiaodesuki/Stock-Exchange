@@ -1,0 +1,25 @@
+# 证券 ui 专属配置；仅非敏感参数通过配置中心分发。
+server:
+  port: ${SECURITIES_UI_PORT:8100}
+  max-http-request-header-size: 16KB
+  tomcat:
+    max-http-form-post-size: 4KB
+  servlet:
+    session:
+      timeout: 30m
+      cookie:
+        name: SECURITIES_SESSION
+        http-only: true
+        same-site: strict
+management:
+  server:
+    port: ${SECURITIES_UI_MANAGEMENT_PORT:18100}
+spring:
+  servlet:
+    multipart:
+      enabled: false
+securities:
+  api-url: ${SECURITIES_API_URL:http://127.0.0.1:8101}
+  websocket-url: ${SECURITIES_WEBSOCKET_URL:ws://localhost:8106/ws}
+  demo:
+    enabled: ${SECURITIES_DEMO_ENABLED:false}

@@ -1,10 +1,11 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+	<!-- 模拟证券交易所 Maven 聚合入口；保留原有模块划分，使用标准源码目录。 -->
 	<modelVersion>4.0.0</modelVersion>
 	<groupId>com.itranswarp.exchange</groupId>
 	<artifactId>build</artifactId>
 	<version>1.0</version>
 	<packaging>pom</packaging>
-	<name>Warp Exchange</name>
+	<name>Stock Exchange</name>
 
 	<modules>
 		<module>../common</module>

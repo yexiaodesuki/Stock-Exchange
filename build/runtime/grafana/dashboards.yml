@@ -1,0 +1,11 @@
+# 自动载入证券版看板；只读配置由版本库管理，指标不代表真实资金安全。
+apiVersion: 1
+providers:
+  - name: securities
+    orgId: 1
+    folder: Securities
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    options:
+      path: /etc/grafana/securities-dashboards

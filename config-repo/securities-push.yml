@@ -1,0 +1,8 @@
+# 证券 push 专属配置；仅非敏感参数通过配置中心分发。
+server:
+  port: ${SECURITIES_PUSH_PORT:8106}
+management:
+  server:
+    port: ${SECURITIES_PUSH_MANAGEMENT_PORT:18106}
+securities:
+  origins: ${SECURITIES_ALLOWED_ORIGINS:http://localhost:8100,http://127.0.0.1:8100}

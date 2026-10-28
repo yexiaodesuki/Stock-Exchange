@@ -1,5 +1,28 @@
+# 本地仅保留应用名、配置中心地址及私密占位符；实际值由 .env.securities 注入。
 spring:
   application:
-    name: ui
+    name: securities-ui
   config:
-    import: configserver:${CONFIG_SERVER:http://localhost:8888}
+    import:
+      - optional:file:./build/.env.securities[.properties]
+      - configserver:${CONFIG_SERVER:http://127.0.0.1:8888}
+  cloud:
+    config:
+      enabled: true
+      fail-fast: true
+  datasource:
+    password: ${SECURITIES_DB_PASSWORD:${SEC_MYSQL_PASSWORD}}
+securities:
+  auth-key: ${SECURITIES_AUTH_KEY}
+  demo:
+    passwords:
+      - ${SECURITIES_DEMO_USER1_PASSWORD:}
+      - ${SECURITIES_DEMO_USER2_PASSWORD:}
+      - ${SECURITIES_DEMO_USER3_PASSWORD:}
+      - ${SECURITIES_DEMO_USER4_PASSWORD:}
+      - ${SECURITIES_DEMO_USER5_PASSWORD:}
+      - ${SECURITIES_DEMO_USER6_PASSWORD:}
+      - ${SECURITIES_DEMO_USER7_PASSWORD:}
+      - ${SECURITIES_DEMO_USER8_PASSWORD:}
+      - ${SECURITIES_DEMO_USER9_PASSWORD:}
+      - ${SECURITIES_DEMO_USER10_PASSWORD:}

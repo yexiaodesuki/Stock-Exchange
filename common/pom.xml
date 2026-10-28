@@ -12,6 +12,9 @@
 	<artifactId>common</artifactId>
 
 	<dependencies>
+		<!-- 各证券应用启动时校验并迁移同一历史，替代独立迁移容器。 -->
+		<dependency><groupId>org.flywaydb</groupId><artifactId>flyway-core</artifactId><version>10.20.1</version></dependency>
+		<dependency><groupId>org.flywaydb</groupId><artifactId>flyway-mysql</artifactId><version>10.20.1</version></dependency>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-actuator</artifactId>
@@ -75,4 +78,15 @@
 			<artifactId>mysql-connector-java</artifactId>
 		</dependency>
 	</dependencies>
+	<build>
+		<!-- Java 源码采用标准目录；仅把同一套版本 SQL 附加为迁移资源。 -->
+		<resources>
+			<resource><directory>src/main/resources</directory></resource>
+			<resource>
+				<directory>../build/sql/securities</directory>
+				<targetPath>db/securities</targetPath>
+				<includes><include>V*.sql</include></includes>
+			</resource>
+		</resources>
+	</build>
 </project>

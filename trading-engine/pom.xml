@@ -1,4 +1,4 @@
-<!-- 交易引擎依赖：使用 Boot 管理的 Actuator 和 Micrometer 提供独立监控接口。 -->
+<!-- 证券唯一入口与集中配置客户端，不再打包旧交易实现。 -->
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
 	<modelVersion>4.0.0</modelVersion>
 
@@ -38,6 +38,7 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+				<configuration><mainClass>com.itranswarp.exchange.SecuritiesEngineApplication</mainClass></configuration>
 			</plugin>
 		</plugins>
 	</build>

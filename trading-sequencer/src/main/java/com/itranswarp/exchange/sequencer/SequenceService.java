@@ -1,166 +1,136 @@
-/* 定序生命周期与事务返回观测：成功位置只在事务代理正常返回后推进。 */
+/* 内部证券定序：先提交事件与幂等键，后确认消息；提示发送失败由引擎数据库追赶兜底。 */
 package com.itranswarp.exchange.sequencer;
 
-import java.util.List;
-import java.util.concurrent.atomic.AtomicLong;
+import com.itranswarp.exchange.securities.SecuritiesChannels;
+import com.itranswarp.exchange.securities.SecuritiesProtocol.*;
+import com.itranswarp.exchange.securities.SecurityCatalog;
+import com.itranswarp.exchange.securities.persistence.ProcessLease;
+import com.itranswarp.exchange.util.JsonUtil;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import javax.sql.DataSource;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
 
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
+public final class SequenceService implements AutoCloseable {
+  private final SequenceHandler handler;
+  private final DataSource source;
+  private final String bootstrap;
+  private final SecuritiesChannels channels;
+  private volatile boolean running, ready;
+  private volatile KafkaConsumer<String, String> consumer;
+  private Thread thread;
+  private ProcessLease lease;
+  private final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(getClass());
 
-import org.apache.kafka.clients.consumer.Consumer;
-import org.apache.kafka.clients.consumer.ConsumerRecords;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.kafka.listener.CommonErrorHandler;
-import org.springframework.kafka.listener.MessageListenerContainer;
-import org.springframework.stereotype.Component;
+  /** 不创建旧 Topic 或在构造阶段启动消费。 */
+  public SequenceService(
+      DataSource source, SecurityCatalog catalog, String bootstrap, String namespace) {
+    this.source = source;
+    this.handler = new SequenceHandler(source, catalog, namespace);
+    this.bootstrap = bootstrap;
+    this.channels = new SecuritiesChannels(namespace);
+  }
 
-import com.itranswarp.exchange.message.event.AbstractEvent;
-import com.itranswarp.exchange.messaging.MessageConsumer;
-import com.itranswarp.exchange.messaging.MessageProducer;
-import com.itranswarp.exchange.messaging.MessageTypes;
-import com.itranswarp.exchange.messaging.Messaging;
-import com.itranswarp.exchange.messaging.MessagingFactory;
-import com.itranswarp.exchange.support.LoggerSupport;
+  /** 专属会话锁拒绝第二定序实例。 */
+  public synchronized void start() {
+    if (thread != null) throw new IllegalStateException("证券定序器已启动");
+    lease = new ProcessLease(source, "sequencer");
+    running = true;
+    thread = new Thread(this::run, "securities-sequencer");
+    thread.setDaemon(true);
+    thread.start();
+  }
 
-/**
- * Sequence events.
- */
-@Component
-public class SequenceService extends LoggerSupport implements CommonErrorHandler {
-
-    @Autowired
-    private com.itranswarp.exchange.monitoring.PipelineMonitoring monitoring = new com.itranswarp.exchange.monitoring.PipelineMonitoring();
-
-    private static final String GROUP_ID = "SequencerGroup";
-
-    @Autowired
-    private SequenceHandler sequenceHandler;
-
-    @Autowired
-    private MessagingFactory messagingFactory;
-
-    @Autowired
-    private MessageTypes messageTypes;
-
-    private MessageProducer<AbstractEvent> messageProducer;
-
-    private AtomicLong sequence;
-    private Thread jobThread;
-    private volatile boolean running;
-
-    /** 启动原工作线程并绑定可见状态，不因监控额外创建消费者。 */
-    @PostConstruct
-    public void init() {
-        Thread thread = new Thread(() -> {
-            logger.info("start sequence job...");
-            // TODO: try get global DB lock:
-            // while (!hasLock()) { sleep(10000); }
-            this.messageProducer = this.messagingFactory.createMessageProducer(Messaging.Topic.TRADE,
-                    AbstractEvent.class);
-
-            // find max event id:
-            this.sequence = new AtomicLong(this.sequenceHandler.getMaxSequenceId());
-
-            // init consumer:
-            logger.info("create message consumer for {}...", getClass().getName());
-            // share same group id:
-            MessageConsumer consumer = this.messagingFactory.createBatchMessageListener(Messaging.Topic.SEQUENCE,
-                    GROUP_ID, this::processMessages, this);
-            // start running:
-            this.running = true;
-            while (running) {
-                try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException e) {
-                    break;
-                }
-            }
-            // close message consumer:
-            logger.info("close message consumer for {}...", getClass().getName());
-            consumer.stop();
-            System.exit(1);
-        });
-        this.jobThread = thread;
-        monitoring.component("sequencer", () -> jobThread != null && jobThread.isAlive() && running && !crash);
-        this.jobThread.start();
-    }
-
-    @PreDestroy
-    public void shutdown() {
-        logger.info("shutdown sequence service...");
-        running = false;
-        if (jobThread != null) {
-            jobThread.interrupt();
-            try {
-                jobThread.join(5000);
-            } catch (InterruptedException e) {
-                logger.error("interrupt job thread failed", e);
-            }
-            jobThread = null;
+  /** 数据库失败不提交 offset；Kafka 提示失败不撤销已经提交的事件。 */
+  private void run() {
+    var config = new HashMap<String, Object>();
+    config.put("bootstrap.servers", bootstrap);
+    config.put("group.id", channels.group("sequencer"));
+    config.put("enable.auto.commit", false);
+    config.put("auto.offset.reset", "earliest");
+    config.put("max.poll.records", 10);
+    config.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+    config.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+    config.put("default.api.timeout.ms", 3000);
+    config.put("session.timeout.ms", 10000);
+    config.put("heartbeat.interval.ms", 2000);
+    try (var kafka = new KafkaConsumer<String, String>(config);
+        var producer =
+            new KafkaProducer<String, String>(
+                Map.of(
+                    "bootstrap.servers",
+                    bootstrap,
+                    "acks",
+                    "all",
+                    "enable.idempotence",
+                    true,
+                    "max.block.ms",
+                    3000,
+                    "request.timeout.ms",
+                    3000,
+                    "delivery.timeout.ms",
+                    6000,
+                    "key.serializer",
+                    "org.apache.kafka.common.serialization.StringSerializer",
+                    "value.serializer",
+                    "org.apache.kafka.common.serialization.StringSerializer"))) {
+      consumer = kafka;
+      kafka.subscribe(List.of(channels.topic("sequence"), channels.topic("transfer")));
+      while (running) {
+        lease.check();
+        var records = kafka.poll(Duration.ofMillis(250));
+        ready = !kafka.assignment().isEmpty();
+        for (var record : records) {
+          lease.check();
+          var event = process(record.topic(), record.value());
+          try {
+            producer
+                .send(new ProducerRecord<>(channels.topic("trade"), JsonUtil.writeJson(event)))
+                .get(8, TimeUnit.SECONDS);
+          } catch (Exception failed) {
+            logger.warn("事件 {} 已提交，Kafka 提示失败，交由数据库追赶", event.sequenceId());
+          }
         }
+        if (!records.isEmpty()) kafka.commitSync();
+      }
+    } catch (org.apache.kafka.common.errors.WakeupException stopped) {
+      /* 本实例正常停止。 */
+    } catch (Exception failure) {
+      logger.error("证券定序失败，停止确认后续消息", failure);
+    } finally {
+      ready = false;
+      running = false;
+      consumer = null;
+      if (lease != null) lease.close();
     }
+  }
 
-    private volatile boolean crash = false;
+  /** 按 Topic 区分普通订单和资金配给；未来公开 API 不得直接暴露本方法。 */
+  public SequencedEvent process(String topic, String json) {
+    return handler.process(topic, json);
+  }
 
-    /**
-     * Message consumer error handler
-     */
-    @Override
-    public void handleBatch(Exception thrownException, ConsumerRecords<?, ?> data, Consumer<?, ?> consumer,
-            MessageListenerContainer container, Runnable invokeListener) {
-        logger.error("batch error!", thrownException);
-        panic();
-    }
+  /** 必须实际分配消费分区才报告就绪。 */
+  public boolean ready() {
+    return ready && running;
+  }
 
-    private void sendMessages(List<AbstractEvent> messages) {
-        this.messageProducer.sendMessages(messages);
-    }
-
-    /** 事务调用结束才统计成功；原有致命错误处理与后续发送顺序不变。 */
-    private synchronized void processMessages(List<AbstractEvent> messages) {
-        if (!running || crash) {
-            panic();
-            return;
-        }
-        if (logger.isInfoEnabled()) {
-            logger.info("do sequence for {} messages...", messages.size());
-        }
-        long start = System.currentTimeMillis();
-        List<AbstractEvent> sequenced = null;
-        try {
-            sequenced = sequenceAndObserve(messages);
-        } catch (Throwable e) {
-            logger.error("exception when do sequence", e);
-            shutdown();
-            panic();
-            throw new Error(e);
-        }
-
-        if (logger.isInfoEnabled()) {
-            long end = System.currentTimeMillis();
-            logger.info("sequenced {} messages in {} ms. current sequence id: {}", messages.size(), (end - start),
-                    this.sequence.get());
-        }
-        sendMessages(sequenced);
-    }
-
-    /** 包含事务提交耗时；提交失败不能推进已成功定序位置，异常交回原处理路径。 */
-    List<AbstractEvent> sequenceAndObserve(List<AbstractEvent> messages) throws Exception {
-        long started = System.nanoTime();
-        try {
-            List<AbstractEvent> result = sequenceHandler.sequenceMessages(messageTypes, sequence, messages);
-            monitoring.count("sequence", "success", result.size());
-            monitoring.progress("sequence", sequence.get());
-            return result;
-        } catch (Exception | Error e) {
-            monitoring.count("sequence", "failure");
-            throw e;
-        } finally { monitoring.duration("sequence", started); }
-    }
-
-    private void panic() {
-        this.crash = true;
-        this.running = false;
-        System.exit(1);
-    }
+  /** 只关闭本实例线程和会话锁。 */
+  @Override
+  public synchronized void close() {
+    running = false;
+    ready = false;
+    var current = consumer;
+    if (current != null) current.wakeup();
+    if (thread != null)
+      try {
+        thread.join(10000);
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+      }
+    if (thread == null && lease != null) lease.close();
+  }
 }

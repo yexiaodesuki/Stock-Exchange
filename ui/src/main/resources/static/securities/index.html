@@ -1,0 +1,25 @@
+<!doctype html>
+<!-- 证券交易与身份页面：本地资源、文本安全渲染；金额写入始终使用十进制字符串。 -->
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stock Exchange · 模拟证券交易</title><link rel="icon" href="data:,"><link rel="stylesheet" href="/securities/style.css"><script type="module" src="/securities/app.mjs"></script></head>
+<body>
+<header><a class="brand" href="/">Stock<span>Exchange</span></a><span class="badge">模拟市场 · 非真实证券</span><div class="spacer"></div><span id="connection" role="status">未连接</span><span id="username"></span><button id="logout" hidden>退出登录</button></header>
+<main>
+  <div id="notice" role="status" aria-live="polite"></div><div id="demo" class="hint"></div>
+  <section id="auth" class="auth panel" hidden><div class="eyebrow">FIVE MARKETS. ONE ACCOUNT.</div><h1 id="auth-title">登录你的交易账户</h1><p class="hint">五只虚构股票，共用一个 USD 资金账户。注册不会自动充值。</p>
+    <form id="auth-form"><label>邮箱<input id="email" name="email" type="email" required maxlength="100" autocomplete="username"></label><label id="name-label" hidden>显示名称<input id="name" name="name" maxlength="60" autocomplete="nickname"></label><label>密码<input id="password" name="password" type="password" required minlength="10" maxlength="128" autocomplete="current-password"></label><button class="primary" id="auth-submit">登录</button></form><p><a id="auth-switch" href="/signup">创建账户</a></p><p class="hint">演示账户：user1@example.com 至 user10@example.com<br>密码见本地 .env.securities（不上传、不展示在网页）。</p>
+  </section>
+  <div id="terminal" hidden>
+    <nav id="symbols" aria-label="选择证券"></nav>
+    <section class="summary"><div><div class="eyebrow">当前证券 / USD</div><h1 id="market-title">—</h1></div><div><small>最新成交</small><strong id="last-price">—</strong></div><div><small>USD 可用 / 冻结</small><strong id="cash">—</strong></div><div><small>当前持仓 可用 / 冻结</small><strong id="holding">—</strong></div></section>
+    <div class="workspace">
+      <section class="panel chart-panel"><div class="panel-title"><h2>价格走势</h2><label class="inline">周期<select id="period"><option value="sec">秒线</option><option value="min" selected>分钟</option><option value="hour">小时</option><option value="day">日线</option></select></label><span id="market-status" class="hint">读取中</span></div><canvas id="chart" aria-label="当前证券蜡烛图"></canvas><div id="chart-caption" class="hint">尚无成交时不生成虚构 K线。</div></section>
+      <section class="panel"><div class="panel-title"><h2>委托盘口</h2><span class="hint">价格优先 · 时间优先</span></div><h3>卖盘</h3><div id="asks"></div><h3>买盘</h3><div id="bids"></div></section>
+      <section class="panel"><h2>提交限价委托</h2><form id="order-form"><label>方向<select id="direction"><option value="BUY">买入</option><option value="SELL">卖出</option></select></label><label>限价 USD<input id="price" type="text" inputmode="decimal" required placeholder="例如 100.00" autocomplete="off"></label><label>数量（整数股）<input id="quantity" type="text" inputmode="numeric" required placeholder="例如 5" autocomplete="off"></label><p class="hint">委托金额 <span id="amount">—</span> USD<br>提交后等待引擎确认，不代表立即成交。</p><button class="primary" id="place-order">提交委托</button></form></section>
+    </div>
+    <div class="lower-grid"><section class="panel"><div class="panel-title"><h2>当前委托</h2><button id="refresh">刷新</button></div><div id="orders"></div></section><section class="panel"><h2>最近成交 · Recent Ticks</h2><div id="ticks"></div></section></div>
+    <section class="panel"><div class="panel-title"><h2>全部持仓与资金</h2><span id="account-status" class="hint"></span></div><div id="positions"></div></section>
+    <section class="panel"><h2>请求进度</h2><div id="pending"></div></section>
+    <section class="panel"><div class="panel-title"><h2>历史委托</h2><button id="history-refresh">刷新历史</button></div><div id="history"></div><h3>本人成交明细</h3><div id="matches">点击历史委托的“成交明细”查看。</div></section>
+  </div>
+</main><footer>Stock Exchange · 教学与功能演示，不构成投资建议 · <a href="https://github.com/yexiaodesuki/Stock-Exchange" target="_blank" rel="noopener noreferrer">Source Code</a></footer>
+</body></html>

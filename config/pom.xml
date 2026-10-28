@@ -25,4 +25,6 @@
 			<artifactId>spring-cloud-config-server</artifactId>
 		</dependency>
 	</dependencies>
+    <!-- 配置中心生成可执行 JAR，供本地独立运行和隔离进程测试使用。 -->
+    <build><finalName>config</finalName><plugins><plugin><groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId><configuration><mainClass>com.itranswarp.exchange.ConfigApplication</mainClass></configuration></plugin></plugins></build>
 </project>

@@ -1,70 +1,80 @@
-<!-- 项目说明：初始化一次建表、日常自动恢复；七应用独立监控不重建业务数据。 -->
+<!-- 启动入口：Docker 运行五项基础设施，Java 可由根目录脚本或 IDEA 启动。 -->
 # Stock Exchange
 
-一个基于 Java 和 Spring Cloud 的交易系统雏形，包含资产管理、订单处理、撮合交易、清算、行情与实时推送等基础功能。项目处于初步开发阶段，后续将持续更新与优化。
+Java 17 / Spring Boot 模拟证券交易所雏形，持续优化中。支持五只虚构股票兑 USD、共享资金账户、分证券持仓、撮合清算、事件与快照恢复、行情和推送。不用于真实资金交易。
 
-## 技术栈
+## 启动
 
-- Java 17、Spring Boot、Spring Cloud Config
-- Maven 多模块工程
-- MySQL、Redis、Kafka
-- Vert.x、WebSocket
-- Vue、Bootstrap
+需要 Java 17、IDEA（导入 `build/pom.xml`）、Docker Desktop Linux 容器。
 
-## 项目结构
+首次将 `build/.env.securities.example` 复制为同目录 `.env.securities`，填写数据库密码、32 字符以上签名密钥、Grafana 密码和十个用户密码，不能使用示例占位值。这个文件被 Git 忽略。
 
-| 模块 | 功能 |
-| --- | --- |
-| common | 公共模型、工具与基础组件 |
-| config | 配置服务 |
-| config-repo | 各应用的配置文件 |
-| trading-api | 交易 API |
-| trading-sequencer | 交易事件定序 |
-| trading-engine | 资产管理、订单、撮合与清算 |
-| quotation | 成交行情与 K线 |
-| push | WebSocket 实时推送 |
-| ui | 用户界面 |
-| build | Maven 聚合构建、数据库脚本与基础设施配置 |
-| parent | 公共依赖与构建配置 |
+也可以手动先启动容器，在 `build` 目录执行：
 
-## 本地运行
+```powershell
+docker compose --env-file .env.securities up -d --wait
+```
 
-1. 准备 Java 17、Maven 和 Docker。
-2. 在项目的 `build` 目录执行 `docker compose -p stock-exchange up -d`，用 `docker compose -p stock-exchange ps` 确认 MySQL、Redis、Kafka 均健康。已有同名容器时先核对来源，不要直接覆盖。
-3. 在 IDEA 中导入 `build/pom.xml`。
-4. 检查 `config-repo` 中的连接配置。
-5. 依次启动配置服务、定序服务、交易引擎、交易 API、行情服务、推送服务和 UI。
-6. 访问 `http://localhost:8000`。
+只有五个容器，名称固定：`mysql`、`redis`、`kafka`、`grafana`、`prometheus`。没有 Java 应用容器或迁移任务容器。
 
-请勿将真实密码、访问令牌或 AI API Key 提交到仓库。
+Docker Desktop 就绪并填写本地配置后，在项目根目录执行一键启动（容器可尚未开启）：
 
-### 首次安装与日常重启
+```powershell
+.\start.ps1
+```
 
-MySQL 使用空的 `build/docker/mysql-data` 目录时，会自动执行 `build/sql/schema.sql`，一次建立全部业务表和 `engine_snapshots` 快照表。不需要中途补建快照表，也不需要手工插入快照。
+脚本先检查五个基础容器，均运行且健康就跳过，否则用现有 Compose 创建缺少的容器、启动已停止的容器并等待健康，不重建已有容器或删除数据卷。然后按需打包，先验证 Config 的六份客户端配置，再逐个等待其他应用就绪，全部成功后自动打开 UI。支持 Windows PowerShell 5.1 / PowerShell 7。若执行策略阻止脚本，可仅对本次调用使用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1`，无需更改系统策略。
 
-交易引擎每次启动都自动执行恢复协调器：空库校验初始状态并保存零序号快照；已有数据时加载有效快照并重放后续事件。只有校验和启动快照保存成功后才开放业务，并启动周期快照任务。访问 `http://localhost:8002/internal/status`，应返回 200 且 `ready` 为 `true`。
+已有 JAR 且源码、资源、POM、打包 SQL 未变化时自动跳过 Maven；首次接管已有产物先核对时间，之后记录输入和 JAR 双指纹。`-Rebuild` 强制干净重建；`-SkipBuild` 显式使用现有 JAR，不保证与源码一致；`-NoBrowser` 不打开浏览器。日志、构建指纹和进程记录在被 Git 忽略的 `build/.local-run/`。重复执行复用本项目 JAR 进程；若需要重建但 Java 仍运行则拒绝覆盖，请先停止旧应用。未知端口占用（包括无法确认归属的 IDEA 实例）会明确报错，不自动停止。
 
-日常重启保留三个组件的数据目录，直接启动容器和应用，禁止重新执行 `schema.sql`（包含删库语句）。恢复、周期保存和验证步骤详见 [快照说明](docs/engine-snapshots.md)。
+停止脚本启动的 Java 应用，在根目录执行下方命令。它按依赖逆序检查历史启动记录，核对 PID、启动时间与本项目 JAR 后才终止，重复执行安全；不停止 Docker、不删除数据或日志。
 
-刻意从零重建开发环境时，先停止所有业务应用，核对容器实际挂载，停止并移除本项目容器，再备份或移走三个组件的数据目录。只删除容器不会清除宿主机目录；不要只清空 MySQL 而保留旧 Kafka 消息及 Redis 缓存。旧教程目录创建的容器不等于当前项目环境。
+```powershell
+.\stop.ps1
+```
 
-空库没有用户或测试资金：需重新注册并通过业务流程准备资金。初始快照不会虚构余额。验证挂单、成交、撤单后，记录余额和活动订单，保留数据重启应用，再检查恢复结果和行情、WebSocket。
+Windows 下使用进程终止，不保证 JVM 优雅关闭；不要把批量结束所有 java.exe 当作替代方法。IDEA 启动的实例仍用 IDEA Stop。
 
-## 交易引擎监控
+也可以继续使用 IDEA；所有应用的 Working directory 均为项目根目录，依次运行：
 
-第一阶段为交易引擎接入健康检查、Prometheus 指标与预置 Grafana 仪表盘。监控使用独立管理端口和 Docker Compose，启动与验证详见 [交易引擎监控说明](docs/engine-monitoring.md)。
+1. `ConfigApplication`。
+2. `SecuritiesEngineApplication`。
+3. `SecuritiesSequencerApplication`、`SecuritiesQuotationApplication`。
+4. `SecuritiesApiApplication`、`SecuritiesPushApplication`。
+5. `SecuritiesUIApplication`。
 
-第二阶段扩展到 UI、交易 API、定序、行情、Push 和配置中心，新增应用视角 MySQL/Redis/Kafka 监控及系统总览、依赖与消息链路面板。启动、指标语义和验证边界详见 [系统与依赖监控](docs/system-monitoring.md)；不包含通知告警、分布式链路追踪或完整中间件服务端监控。
+业务应用直接读取 `build/.env.securities`，再从 Config Server 读取公共配置；无需在启动脚本中导出密码。MySQL 容器创建数据库，Java 应用首次连接时自动执行全部 Flyway 迁移（含快照表），重复启动只校验版本。Kafka 在自己的容器内创建并校验 Topic。
 
-## 后续计划
+页面：[localhost:8100](http://localhost:8100)；Grafana：[localhost:3000](http://localhost:3000)；Prometheus：[localhost:9090](http://localhost:9090)。
 
-- 引入 Nginx 网关与统一访问入口
-- 完善系统监控、日志与告警
-- 优化可靠性、性能与安全性
-- 补充自动化测试与部署流程
-- 探索 AI 辅助分析与智能交互功能
-- 持续改善界面与使用体验
+## 账户与数据
 
-## 项目状态
+全新环境设置 `SECURITIES_DEMO_ENABLED=true` 后自动创建 `user1@example.com` 至 `user10@example.com`，名称“用户一”至“用户十”，密码分别取配置中的十个用户密码。初始化通过真实事件链配资、挂单、撮合，可重复启动且不会重复配资。
 
-当前版本为系统雏形，主要用于开发、学习与验证，不适用于真实资金交易。
+旧两用户演示环境启用演示初始化后，默认保留 `buyer@example.com`、`seller@example.com` 并补齐 `user3@example.com` 至 `user10@example.com`；新增用户各有 100000 USD 和五证券各 1000 股。另行明确授权后可仅迁移原两人的登录邮箱和密码，不变更用户 ID、资产及交易记录；本机已完成该维护，现使用 user1 至 user10 登录。普通重启不会重置密码或重复配资，详见 [演示用户补齐](docs/demo-users.md)。容器和数据卷不是同一个东西；日常停止使用 `docker compose --env-file .env.securities stop`，不要删除数据卷。
+
+## 模块与配置
+
+交易链：UI → API → Kafka → 定序 → MySQL 事件 → 引擎撮合清算 → 行情 / 推送 → 页面。引擎以一致性快照加事件增量重放恢复。
+
+- `common`：证券协议、目录、自动迁移、持久输出与缓存。
+- `config / config-repo`：配置服务和非敏感公共 / 应用配置。
+- `trading-engine / trading-sequencer`：资金、持仓、订单、撮合清算、恢复和定序。
+- `trading-api / quotation / push / ui`：接口、行情、WebSocket 和页面。
+- `build`：唯一 Compose、Maven 聚合入口，以及 SQL、监控和测试配套目录。
+
+旧 BTC 实现已移除；各模块使用标准 Maven 源码目录，业务代码统一在 com.itranswarp.exchange 包下。启动入口统一位于模块根包，装配放 config，运行协调使用 Service，接口放 web；完整目录约定见 [统一目录结构](docs/package-layout.md)。各应用本地引导为 src/main/resources/application.yml；保留通用工具和现有证券交易实现。
+
+阅读代码可从 [业务分层与调用关系](docs/business-layering.md) 开始：引擎按资产、订单、撮合、清算分工，API 使用 Controller → Service，后台协调器只负责运行流程。UI 页面保持原样。
+
+## 监控与验证
+
+Grafana 使用 admin 和本地配置的密码，打开 Securities 文件夹内的“证券交易所 - 系统总览”。只有启动对应 Java 应用后，Prometheus 的该应用 Target 才会变为 UP。Java 管理端口保持本机监听；Docker Desktop 使用 `host.docker.internal` 访问，不开放局域网管理入口。其他平台可能需要额外的本机网络接入配置。
+
+```powershell
+mvn -f build/pom.xml test
+```
+
+这只代表可运行的 Maven 测试，不等于完整联调。隔离数据库、恢复及真实进程联调方式见 [运行与验证说明](docs/running.md)。测试脚本仅用于验收，不参与环境启动。
+
+后续继续完善监控、网关、可靠性和受控 AI 辅助能力；当前不具备生产级交易所保障。

@@ -1,0 +1,6 @@
+# 证券 api 专属配置；仅非敏感参数通过配置中心分发。
+server:
+  port: ${SECURITIES_API_PORT:8101}
+management:
+  server:
+    port: ${SECURITIES_API_MANAGEMENT_PORT:18101}

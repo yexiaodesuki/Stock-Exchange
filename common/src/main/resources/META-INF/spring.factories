@@ -1,0 +1,2 @@
+# Boot 生命周期统一检查集中配置，不依赖业务包扫描。
+org.springframework.boot.env.EnvironmentPostProcessor=com.itranswarp.exchange.securities.RequiredConfigEnvironment
