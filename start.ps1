@@ -1,4 +1,4 @@
-﻿# 一键启动证券环境：补齐五个基础容器，按需打包，配置中心就绪后启动客户端，不重置数据。
+﻿# 一键启动证券环境：补齐六个容器，按需打包，配置中心先就绪，最后验证网关，不重置数据。
 #requires -Version 5.1
 param(
     [switch]$SkipBuild,
@@ -55,10 +55,10 @@ function New-ExchangeApplicationPlan {
     }
 }
 
-# 五个容器均存在且运行健康才允许跳过 Compose，不把容器存在当作已就绪。
+# 六个容器均存在且运行健康才允许跳过 Compose，不把容器存在当作已就绪。
 function Test-ExchangeContainersReady {
     param([array]$States)
-    foreach ($name in @('mysql', 'redis', 'kafka', 'grafana', 'prometheus')) {
+    foreach ($name in @('mysql', 'redis', 'kafka', 'grafana', 'prometheus', 'nginx')) {
         $rows = @($States | Where-Object { $_.Name -eq $name })
         if ($rows.Count -ne 1 -or $rows[0].State -ne 'running' -or $rows[0].Health -ne 'healthy') { return $false }
     }
@@ -69,7 +69,7 @@ function Test-ExchangeContainersReady {
 function Ensure-ExchangeContainers {
     param([scriptblock]$Inspect, [scriptblock]$StartContainers)
     if (Test-ExchangeContainersReady @(& $Inspect)) {
-        Write-Host '五个 Docker 容器均已运行且健康，跳过容器启动。'
+        Write-Host '六个 Docker 容器均已运行且健康，跳过容器启动。'
         return
     }
     Write-Host '正在补齐并等待 Docker 容器健康；首次运行可能需要下载镜像 ...'
@@ -160,6 +160,7 @@ function Get-ExchangeExistingProcess {
 # 就绪条件检查响应内容，而不是只看 HTTP 端口能否连接。
 function Test-ExchangeReadyResponse {
     param([string]$Kind, $Response)
+    if ($Kind -eq 'gateway') { return ![string]::IsNullOrEmpty($Response.csrf) -and $Response.websocket -eq '/ws' }
     if ($Kind -eq 'config') {
         if ($Response.name -ne 'securities-engine') { return $false }
         foreach ($item in $Response.propertySources) {
@@ -258,6 +259,9 @@ function Start-ExchangeProject {
     }
     $java = (Get-Command java -ErrorAction Stop).Source
     $applications = @(New-ExchangeApplicationPlan $ProjectRoot $settings)
+    if ($applications[-1].Port -ne 8100 -or $applications[5].Port -ne 8106) {
+        throw '当前网关上游固定使用 UI 8100 / Push 8106；自定义这两个端口须同步修改 build/nginx/conf.d/exchange.conf。'
+    }
     $ports = @($applications | ForEach-Object { $_.Port; $_.ManagementPort } | Select-Object -Unique)
     if ($ports.Count -ne 14) { throw '应用业务端口与管理端口不能重复。' }
     $docker = (Get-Command docker -ErrorAction Stop).Source
@@ -336,7 +340,10 @@ function Start-ExchangeProject {
             }
             Write-Host 'Config 的六份客户端配置校验通过，开始启动业务应用。'
         }
-        $uiUrl = 'http://localhost:' + $applications[-1].Port
+        $gatewayPort = [int](Get-ExchangeSetting $settings 'SEC_GATEWAY_PORT' '8080')
+        $uiUrl = 'http://localhost:' + $gatewayPort
+        $gateway = [pscustomobject]@{ Name = 'Nginx 到 UI 的会话链路'; Kind = 'gateway'; ReadyUrl = $uiUrl + '/session' }
+        Wait-ExchangeApplicationReady $gateway $TimeoutSeconds -Alive { return $true } -Probe { param($url) Invoke-RestMethod -Uri $url -TimeoutSec 3 }
         Write-Host ('所有应用已就绪：' + $uiUrl)
         if (!$NoBrowser) {
             try { Start-Process $uiUrl -ErrorAction Stop }

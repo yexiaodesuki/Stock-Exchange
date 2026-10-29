@@ -1,9 +1,15 @@
 # 证券 ui 专属配置；仅非敏感参数通过配置中心分发。
 server:
+  # 只接受回环代理的转发头，不信任任意私网地址。外部用户无法直连回环监听。
+  forward-headers-strategy: native
+  tomcat:
+    remoteip:
+      internal-proxies: '127\.0\.0\.1|0:0:0:0:0:0:0:1|::1'
+      remote-ip-header: X-Forwarded-For
+      protocol-header: X-Forwarded-Proto
+    max-http-form-post-size: 4KB
   port: ${SECURITIES_UI_PORT:8100}
   max-http-request-header-size: 16KB
-  tomcat:
-    max-http-form-post-size: 4KB
   servlet:
     session:
       timeout: 30m
@@ -20,6 +26,6 @@ spring:
       enabled: false
 securities:
   api-url: ${SECURITIES_API_URL:http://127.0.0.1:8101}
-  websocket-url: ${SECURITIES_WEBSOCKET_URL:ws://localhost:8106/ws}
+  websocket-url: ${SECURITIES_WEBSOCKET_URL:/ws}
   demo:
     enabled: ${SECURITIES_DEMO_ENABLED:false}

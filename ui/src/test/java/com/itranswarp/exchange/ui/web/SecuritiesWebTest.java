@@ -7,6 +7,24 @@ import org.junit.jupiter.api.Test;
 import org.springframework.mock.web.*;
 
 class SecuritiesWebTest {
+  /** 本人模拟入金入口明确放行，禁止通用资金命令、内部配资和任意写路径。 */
+  @Test void depositRoutesKeepInternalFundingPrivate() {
+    assertTrue(MvcController.allowed("/api/v1/deposits",true));
+    assertTrue(MvcController.allowed("/api/v1/deposits",false));
+    assertTrue(MvcController.allowed("/api/v1/deposits/policy",false));
+    assertTrue(MvcController.allowed("/api/v1/deposits/12345678-1234-1234-1234-123456789abc",false));
+    assertFalse(MvcController.allowed("/api/v1/deposits/policy",true));
+    assertFalse(MvcController.allowed("/api/v1/deposits/internal/credit",true));
+    assertFalse(MvcController.allowed("/api/v1/transfer",true));
+  }
+  /** 同源网关路径可以启动，其他相对路径不能成为任意推送目标。 */
+  @Test
+  void acceptsOnlyFixedGatewayWebsocketPath() {
+    assertDoesNotThrow(() -> new UISecurityFilter("/ws"));
+    assertThrows(IllegalArgumentException.class, () -> new UISecurityFilter("/other"));
+    assertThrows(IllegalArgumentException.class, () -> new UISecurityFilter("//evil/ws"));
+  }
+
   /** 代理只接受新证券接口，不允许内部转账或编码穿越路径。 */
   @Test
   void restrictsProxyRoutes() {

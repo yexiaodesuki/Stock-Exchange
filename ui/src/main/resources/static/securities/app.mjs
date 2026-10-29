@@ -1,6 +1,8 @@
-/* 五证券终端：安全会话代理、HTTP 权威快照、WS 失效提示、固定幂等键跟踪异步请求。 */
-import {cents,shares,dollars,decimal,total,Selection} from './domain.mjs';
+/* 五证券终端：安全会话、主动模拟入金、HTTP 权威快照和固定幂等键跟踪异步请求。 */
+import {cents,shares,dollars,decimal,total,Selection,websocketEndpoint} from './domain.mjs';
 import {drawChart} from './chart.mjs';
+import {mountDeposits} from './deposits.mjs';
+let stopDeposits=()=>{};
 /** 固定 ID 的局部查找器，不接收用户输入生成 HTML 或选择器。 */
 const $=id=>document.getElementById(id);
 let session,user,catalog=[],socket,selection=new Selection(),reading,refreshing=false,queued=false,activeBars=[],accountHealthy=false,pending=[],resolving=false,closed=false,connectTimer,refreshTimer,resolveTimer;
@@ -15,7 +17,7 @@ async function api(path,{method='GET',body,key,signal}={}){
   return {value,status:response.status};
 }
 /** 登录失效后停止使用旧私有数据，但不把未决委托说成失败。 */
-function expire(){closed=true;socket?.close();clearTimeout(connectTimer);clearInterval(refreshTimer);clearInterval(resolveTimer);$('terminal').hidden=true;$('auth').hidden=false;text('username','');text('connection','登录已过期');}
+function expire(){closed=true;stopDeposits();socket?.close();clearTimeout(connectTimer);clearInterval(refreshTimer);clearInterval(resolveTimer);$('terminal').hidden=true;$('auth').hidden=false;text('username','');text('connection','登录已过期');}
 /** 表格完全用 DOM 文本构建，按钮函数不依赖可执行 HTML 字符串。 */
 function table(id,headers,rows){const parent=$(id);parent.replaceChildren();if(!rows.length){parent.textContent='暂无记录';return;}const table=document.createElement('table'),head=document.createElement('tr');for(const title of headers){const cell=document.createElement('th');cell.textContent=title;head.append(cell);}table.append(head);for(const row of rows){const line=document.createElement('tr');for(const value of row){const cell=document.createElement('td');if(value instanceof Node)cell.append(value);else cell.textContent=value;line.append(cell);}table.append(line);}parent.append(table);}
 /** 操作按钮显式绑定闭包，订单证券在创建时就固定，切换股票不能改写其目标。 */
@@ -28,11 +30,11 @@ function persist(){sessionStorage.setItem('securities.pending.'+user.id,JSON.str
 function renderPending(){table('pending',['证券','操作','状态'],pending.map(item=>[catalog.find(s=>s.securityId===String(item.securityId))?.symbol||item.securityId,item.label,item.requestId?'等待引擎确认':'提交待确认，使用原标识重试']));}
 /** 提交前先登记固定幂等键，页面刷新后仍能继续查询同一笔请求。 */
 async function submit(path,body,securityId,label){if(pending.length>=20)throw new Error('未决请求过多，请等待确认');const item={path,body,securityId:String(securityId),label,key:crypto.randomUUID(),requestId:null};pending.push(item);persist();await resolvePending();}
-/** 每笔请求失败保留原键；结果存在且 COMPLETED 才判断接受或业务拒绝。 */
+/** 每笔请求失败保留原键；COMPLETED 只提示已执行，成交状态仍以委托和成交明细为准。 */
 async function resolvePending(){if(resolving||closed||!user)return;resolving=true;try{for(const item of [...pending]){
     try{
       if(item.requestId){let result;try{if(!/^[A-Za-z0-9._:-]{1,100}$/.test(item.requestId))throw new Error('请求标识格式错误');result=(await api('/api/v1/requests/'+item.requestId)).value;}catch(error){if(error.status!==404)throw error;}
-        if(result?.status==='COMPLETED'){pending=pending.filter(value=>value!==item);persist();text('notice',result.accepted?`${item.label}已执行（不代表全部成交）`:`${item.label}被拒绝：${result.reason||'业务条件不满足'}`);await refresh();continue;}
+        if(result?.status==='COMPLETED'){pending=pending.filter(value=>value!==item);persist();text('notice',result.accepted?`${item.label}已执行`:`${item.label}被拒绝：${result.reason||'业务条件不满足'}`);await refresh();continue;}
         if(result)continue;
       }
       const result=await api(item.path,{method:'POST',body:item.body,key:item.key});item.requestId=result.value.requestId;persist();
@@ -65,13 +67,13 @@ async function select(id){selection.select(id);reading?.abort();activeBars=[];fo
 /** 服务端订阅确认后再次读快照，覆盖握手与 HTTP 读取之间发生的成交；不合并通知载荷。 */
 function subscribe(){if(socket?.readyState===WebSocket.OPEN){socket.send(JSON.stringify({action:'unsubscribe',securityIds:catalog.map(s=>s.securityId)}));socket.send(JSON.stringify({action:'subscribe',securityIds:[selection.id]}));}}
 /** 票据仅保存在连接闭包；断线、订阅确认与 resync 都触发 HTTP 重建，5 秒轮询兜底。 */
-async function connect(){if(closed)return;try{const {value}=await api('/api/v1/ws-ticket',{method:'POST',body:{}});if(closed)return;const ws=new WebSocket(session.websocket+'?ticket='+encodeURIComponent(value.ticket));socket=ws;
+async function connect(){if(closed)return;try{const {value}=await api('/api/v1/ws-ticket',{method:'POST',body:{}});if(closed)return;const endpoint=websocketEndpoint(session.websocket,location.href);endpoint.searchParams.set('ticket',value.ticket);const ws=new WebSocket(endpoint);socket=ws;
   ws.addEventListener('open',()=>{if(ws!==socket)return;text('connection','WebSocket 已连接');subscribe();});
   ws.addEventListener('message',event=>{if(ws!==socket||closed)return;try{const value=JSON.parse(event.data);if(value.type==='subscription.ack'){const expected=value.securityIds?.map(String)||[];if(expected.includes(selection.id))refresh();}else if(value.type==='resync.required'||value.type==='account.changed'||String(value.securityId)===selection.id)refresh();}catch(invalid){text('connection','推送数据异常，正在重新同步');refresh();}});
   ws.addEventListener('close',()=>{if(closed||ws!==socket)return;text('connection','WebSocket 重连中（HTTP 查询可用）');connectTimer=setTimeout(connect,3000);});
   ws.addEventListener('error',()=>{/* 浏览器随后触发 close；不打印带一次性票据的 URL。 */});
  }catch(error){if(!closed){text('connection','推送暂不可用，稍后重连');connectTimer=setTimeout(connect,5000);}}}
-/** 初始化身份与事件监听；演示进度轮询不会自动充值，只有显式 Demo 模式会执行。 */
+/** 初始化身份、主动入金入口与行情监听；普通注册和演示进度轮询不自动充值。 */
 async function start(){
   session=(await api('/session')).value;user=session.user.id?session.user:null;
   const signup=location.pathname==='/signup';$('auth').hidden=!!user;$('terminal').hidden=!user;$('logout').hidden=!user;
@@ -79,7 +81,7 @@ async function start(){
   else{
     text('username',user.name);catalog=(await api('/api/v1/securities')).value.map(s=>({...s,securityId:String(s.securityId)}));
     try{const stored=JSON.parse(sessionStorage.getItem('securities.pending.'+user.id)||'[]');pending=Array.isArray(stored)?stored.filter(p=>typeof p.key==='string'&&typeof p.path==='string'&&p.path.startsWith('/api/v1/orders')).slice(0,20):[];}catch(invalid){pending=[];}
-    for(const security of catalog){const node=button(security.symbol+' '+security.name,()=>select(security.securityId));node.dataset.id=security.securityId;$('symbols').append(node);}renderPending();await select(catalog[0].securityId);connect();resolvePending();refreshTimer=setInterval(refresh,5000);resolveTimer=setInterval(resolvePending,2500);
+    for(const security of catalog){const node=button(security.symbol+' '+security.name,()=>select(security.securityId));node.dataset.id=security.securityId;$('symbols').append(node);}renderPending();await select(catalog[0].securityId);stopDeposits=mountDeposits({api,user,refresh,showError});connect();resolvePending();refreshTimer=setInterval(refresh,5000);resolveTimer=setInterval(resolvePending,2500);
   }
   showDemo(session.demo);
   if(['RUNNING','FAILED'].includes(session.demo.state)){const timer=setInterval(async()=>{try{const value=(await api('/session')).value;showDemo(value.demo);if(value.demo.state==='COMPLETE'){clearInterval(timer);refresh();}}catch(error){showError(error);}},3000);}

@@ -82,11 +82,14 @@ try {
 } finally { [Environment]::SetEnvironmentVariable($testKey, $previous, 'Process') }
 Write-Host 'PASS 8：配置优先级且不修改父环境'
 
-$healthy = @('mysql', 'redis', 'kafka', 'grafana', 'prometheus') | ForEach-Object { [pscustomobject]@{ Name = $_; State = 'running'; Health = 'healthy' } }
+$healthy = @('mysql', 'redis', 'kafka', 'grafana', 'prometheus', 'nginx') | ForEach-Object { [pscustomobject]@{ Name = $_; State = 'running'; Health = 'healthy' } }
 $state = [pscustomobject]@{ Starts = 0; Inspections = 0 }
 Ensure-ExchangeContainers -Inspect { return $healthy } -StartContainers { $state.Starts++ }
 Assert-Startup ($state.Starts -eq 0) '五个容器健康时不得重复执行 Compose up'
 Assert-Startup (!(Test-ExchangeContainersReady @($healthy | Where-Object { $_.Name -ne 'kafka' }))) '缺容器不能跳过'
+Assert-Startup (!(Test-ExchangeContainersReady @($healthy | Where-Object { $_.Name -ne 'nginx' }))) '缺网关不能跳过'
+Assert-Startup (Test-ExchangeReadyResponse 'gateway' ([pscustomobject]@{csrf='proof';websocket='/ws'})) '网关会话链路应就绪'
+Assert-Startup (!(Test-ExchangeReadyResponse 'gateway' ([pscustomobject]@{csrf='proof';websocket='ws://localhost:8106/ws'}))) '不能绕过网关连接推送'
 Write-Host 'PASS 9：全部健康时跳过 Docker 启动'
 
 $stopped = @($healthy | ForEach-Object { [pscustomobject]@{ Name = $_.Name; State = $(if ($_.Name -eq 'redis') { 'exited' } else { 'running' }); Health = $_.Health } })

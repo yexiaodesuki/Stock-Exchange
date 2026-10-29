@@ -1,15 +1,20 @@
 <!doctype html>
-<!-- 证券交易与身份页面：本地资源、文本安全渲染；金额写入始终使用十进制字符串。 -->
+<!-- 证券交易、身份与模拟入金页面：仅本地资源，金额通过精确十进制字符串提交。 -->
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Stock Exchange · 模拟证券交易</title><link rel="icon" href="data:,"><link rel="stylesheet" href="/securities/style.css"><script type="module" src="/securities/app.mjs"></script></head>
 <body>
 <header><a class="brand" href="/">Stock<span>Exchange</span></a><span class="badge">模拟市场 · 非真实证券</span><div class="spacer"></div><span id="connection" role="status">未连接</span><span id="username"></span><button id="logout" hidden>退出登录</button></header>
 <main>
   <div id="notice" role="status" aria-live="polite"></div><div id="demo" class="hint"></div>
   <section id="auth" class="auth panel" hidden><div class="eyebrow">FIVE MARKETS. ONE ACCOUNT.</div><h1 id="auth-title">登录你的交易账户</h1><p class="hint">五只虚构股票，共用一个 USD 资金账户。注册不会自动充值。</p>
-    <form id="auth-form"><label>邮箱<input id="email" name="email" type="email" required maxlength="100" autocomplete="username"></label><label id="name-label" hidden>显示名称<input id="name" name="name" maxlength="60" autocomplete="nickname"></label><label>密码<input id="password" name="password" type="password" required minlength="10" maxlength="128" autocomplete="current-password"></label><button class="primary" id="auth-submit">登录</button></form><p><a id="auth-switch" href="/signup">创建账户</a></p><p class="hint">演示账户：user1@example.com 至 user10@example.com<br>密码见本地 .env.securities（不上传、不展示在网页）。</p>
+    <form id="auth-form"><label>邮箱<input id="email" name="email" type="email" required maxlength="100" autocomplete="username"></label><label id="name-label" hidden>显示名称<input id="name" name="name" maxlength="60" autocomplete="nickname"></label><label>密码<input id="password" name="password" type="password" required minlength="10" maxlength="128" autocomplete="current-password"></label><button class="primary" id="auth-submit">登录</button></form><p><a id="auth-switch" href="/signup">创建账户</a></p>
   </section>
   <div id="terminal" hidden>
     <nav id="symbols" aria-label="选择证券"></nav>
+    <div class="deposit-actions"><button id="deposit-open" type="button">模拟入金 / 入金记录</button></div>
+    <dialog id="deposit-dialog" aria-labelledby="deposit-title"><h2 id="deposit-title">模拟 USD 入金</h2><p class="hint">仅增加模拟资金，不涉及真实支付；不赠送股票、不重置账户。</p><p id="deposit-policy" class="hint">读取额度中…</p>
+      <form id="deposit-form"><label>入金金额 USD<input id="deposit-amount" type="text" inputmode="decimal" required maxlength="15" value="1000.00"></label><div class="deposit-actions"><button type="button" data-deposit-amount="1000.00">1000</button><button type="button" data-deposit-amount="10000.00">10000</button><button type="button" data-deposit-amount="100000.00">100000</button></div><button id="deposit-submit" class="primary">确认模拟入金</button></form>
+      <p id="deposit-status" role="status" aria-live="polite"></p><h3>本人入金记录</h3><div id="deposit-history" class="scroll">暂无记录</div><div class="deposit-actions"><button id="deposit-prev" type="button">上一页</button><button id="deposit-next" type="button">下一页</button><button id="deposit-retry" type="button">刷新 / 原申请重试</button><button id="deposit-close" type="button">关闭</button></div>
+    </dialog>
     <section class="summary"><div><div class="eyebrow">当前证券 / USD</div><h1 id="market-title">—</h1></div><div><small>最新成交</small><strong id="last-price">—</strong></div><div><small>USD 可用 / 冻结</small><strong id="cash">—</strong></div><div><small>当前持仓 可用 / 冻结</small><strong id="holding">—</strong></div></section>
     <div class="workspace">
       <section class="panel chart-panel"><div class="panel-title"><h2>价格走势</h2><label class="inline">周期<select id="period"><option value="sec">秒线</option><option value="min" selected>分钟</option><option value="hour">小时</option><option value="day">日线</option></select></label><span id="market-status" class="hint">读取中</span></div><canvas id="chart" aria-label="当前证券蜡烛图"></canvas><div id="chart-caption" class="hint">尚无成交时不生成虚构 K线。</div></section>

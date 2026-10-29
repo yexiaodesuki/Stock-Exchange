@@ -1,4 +1,4 @@
-/* 六进程隔离验收：演示中断续跑、真实登录与代理、首批撮合、重复启动及浏览器页面操作。 */
+/* 六进程隔离验收：交易、模拟入金、强杀恢复和页面；独立 Nginx 验证完整网关路径。 */
 package com.itranswarp.exchange.ui.demo;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -25,7 +25,7 @@ class SecuritiesUiProcessTest {
   private final Map<String, Process> processes = new HashMap<>();
   private final Map<String, Integer> ports = new HashMap<>();
   private final HttpClient probe =
-      HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
+      HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).connectTimeout(Duration.ofSeconds(2)).build();
   private String namespace, key, buyerPassword, sellerPassword, csrf;
   private Path root, logs;
   private JdbcTemplate jdbc;
@@ -38,6 +38,8 @@ class SecuritiesUiProcessTest {
       throw new IllegalStateException("禁止测试开发库");
     var source =
         new DriverManagerDataSource(url, "securities", System.getenv("SECURITIES_DB_PASSWORD"));
+    // 单独运行此测试也先执行正式迁移，不能依赖其他测试碰巧创建表。
+    com.itranswarp.exchange.securities.SecurityCatalog.load(source);
     jdbc = new JdbcTemplate(source);
     reset();
     var users = new UserService(source);
@@ -111,6 +113,8 @@ class SecuritiesUiProcessTest {
       throw new IllegalStateException("禁止测试开发库");
     var source =
         new DriverManagerDataSource(url, "securities", System.getenv("SECURITIES_DB_PASSWORD"));
+    // 单独选择网关浏览器用例时同样建立完整的隔离表结构。
+    com.itranswarp.exchange.securities.SecurityCatalog.load(source);
     jdbc = new JdbcTemplate(source);
     reset();
     root = Path.of(System.getenv("SECURITIES_TEST_ROOT"));
@@ -123,6 +127,7 @@ class SecuritiesUiProcessTest {
     for (String module :
         List.of("trading-engine", "trading-sequencer", "quotation", "trading-api", "push", "ui"))
       ports.put(module, port());
+    ports.put("gateway", port());
     var channels = new SecuritiesChannels(namespace);
     var topics =
         List.of("sequence", "transfer", "trade", "tick").stream().map(channels::topic).toList();
@@ -332,6 +337,7 @@ class SecuritiesUiProcessTest {
                     null)
                 .statusCode());
         assertEquals(11, count("SELECT COUNT(*) FROM users"));
+        verifyDeposits(newcomer,again);
         if ("true".equals(System.getenv("SECURITIES_TEST_BROWSER"))) browser();
         else System.out.println("未启用浏览器验收：设置 SECURITIES_TEST_BROWSER=true 后运行第四阶段脚本。");
         String logoutCsrf =
@@ -376,6 +382,9 @@ class SecuritiesUiProcessTest {
   private void reset() {
     for (String table :
         List.of(
+            "deposit_outbox",
+            "deposit_requests",
+            "deposit_daily_limits",
             "demo_steps",
             "bootstrap_runs",
             "password_auths",
@@ -447,8 +456,10 @@ class SecuritiesUiProcessTest {
     env.put("SEC_REDIS_URI", System.getenv("SECURITIES_TEST_REDIS_URI"));
     env.put("SECURITIES_ENGINE_URL", base("trading-engine"));
     env.put("SECURITIES_API_URL", base("trading-api"));
-    env.put("SECURITIES_WEBSOCKET_URL", "ws://127.0.0.1:" + ports.get("push") + "/ws");
-    env.put("SECURITIES_ALLOWED_ORIGINS", base("ui"));
+    env.put(
+        "SECURITIES_WEBSOCKET_URL",
+        gatewayTest() ? "/ws" : "ws://127.0.0.1:" + ports.get("push") + "/ws");
+    env.put("SECURITIES_ALLOWED_ORIGINS", base("ui") + "," + base("gateway"));
     env.put("SECURITIES_DEMO_ENABLED", Boolean.toString(demo));
     env.put("SECURITIES_DEMO_BUYER_PASSWORD", buyerPassword);
     env.put("SECURITIES_DEMO_SELLER_PASSWORD", sellerPassword);
@@ -465,6 +476,35 @@ class SecuritiesUiProcessTest {
             .start());
   }
 
+  /** 通过真实 UI/API/Kafka/引擎验证入金、身份隔离，强制终止引擎后资金与流水不重复。 */
+  private void verifyDeposits(HttpClient newcomer,HttpClient other) throws Exception {
+    String token=tree(send(newcomer,"GET","/session",null,null,null)).path("csrf").asText();
+    assertEquals(401,send(client(),"GET","/api/v1/deposits",null,null,null).statusCode());
+    assertEquals(403,send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"1000.00\"}",null,"deposit-denied").statusCode());
+    assertEquals(400,send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"1.001\"}",token,"deposit-invalid").statusCode());
+    var created=send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"1000.00\",\"userId\":1000}",token,"new-user-deposit");
+    assertEquals(202,created.statusCode());
+    String id=tree(created).path("depositId").asText();
+    await(()->tree(send(newcomer,"GET","/api/v1/deposits/"+id,null,null,null)).path("status").asText().equals("SUCCEEDED"),"新用户入金到账");
+    amount("1000",tree(send(newcomer,"GET","/api/v1/account",null,null,null)).path("cash").path("available"));
+    assertEquals(404,send(other,"GET","/api/v1/deposits/"+id,null,null,null).statusCode());
+    assertEquals(409,send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"1001\"}",token,"new-user-deposit").statusCode());
+    assertEquals(id,tree(send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"1000\"}",token,"new-user-deposit")).path("depositId").asText());
+    int eventsBefore=count("SELECT COUNT(*) FROM events"),flowsBefore=count("SELECT COUNT(*) FROM transfer_logs");
+    var process=processes.remove("trading-engine");process.destroyForcibly();assertTrue(process.waitFor(12,TimeUnit.SECONDS));
+    // 引擎不可用期间先持久登记，不能依赖用户再点一次来触发发送。
+    var pending=send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"25.00\"}",token,"while-engine-down");
+    assertEquals(202,pending.statusCode());String next=tree(pending).path("depositId").asText();
+    stop("trading-api");start("trading-api",false);
+    start("trading-engine",false);
+    await(()->status("trading-engine","/internal/securities/status")==200,"入金后引擎恢复");
+    await(()->tree(send(newcomer,"GET","/api/v1/deposits/"+next,null,null,null)).path("status").asText().equals("SUCCEEDED"),"API 重启从发件箱继续入金");
+    amount("1025",tree(send(newcomer,"GET","/api/v1/account",null,null,null)).path("cash").path("available"));
+    assertEquals(eventsBefore+1,count("SELECT COUNT(*) FROM events"));
+    assertEquals(flowsBefore+1,count("SELECT COUNT(*) FROM transfer_logs"));
+    assertEquals(2,tree(send(newcomer,"GET","/api/v1/deposits",null,null,null)).size());
+  }
+
   /** 只停止本测试拥有的应用，不触碰用户已启动的 Java 服务。 */
   private void stop(String module) throws Exception {
     var process = processes.remove(module);
@@ -479,33 +519,120 @@ class SecuritiesUiProcessTest {
 
   /** 可选的真正 Chromium 页面测试，不用 HTTP 测试冒充浏览器渲染。 */
   private void browser() throws Exception {
-    var builder = new ProcessBuilder("node", root.resolve("ui/src/test/js/browser.mjs").toString());
-    var env = builder.environment();
-    env.put("SECURITIES_BROWSER_URL", base("ui"));
-    env.put("SECURITIES_BROWSER_BUYER_PASSWORD", buyerPassword);
-    env.put("SECURITIES_BROWSER_SELLER_PASSWORD", sellerPassword);
-    env.put("SECURITIES_BROWSER_OUTPUT", logs.toString());
-    var process =
-        builder
-            .redirectErrorStream(true)
-            .redirectOutput(logs.resolve("browser.log").toFile())
-            .start();
+    String container = "securities-gateway-test-" + UUID.randomUUID().toString().replace("-", "");
     try {
-      assertTrue(process.waitFor(120, TimeUnit.SECONDS), "浏览器测试超时：" + logs);
-      assertEquals(0, process.exitValue(), Files.readString(logs.resolve("browser.log")));
-    } finally {
-      if (process.isAlive()) {
-        process
-            .descendants()
-            .forEach(
-                child -> {
+      if (gatewayTest()) {
+        Path conf = Files.createDirectory(logs.resolve("nginx-conf"));
+        Files.writeString(
+            conf.resolve("exchange.conf"),
+            Files.readString(root.resolve("build/nginx/conf.d/exchange.conf"))
+                .replace("host.docker.internal:8100", "host.docker.internal:" + ports.get("ui"))
+                .replace("host.docker.internal:8106", "host.docker.internal:" + ports.get("push")));
+        docker(
+            "run",
+            "-d",
+            "--name",
+            container,
+            "--network",
+            "stock-exchange-securities_default",
+            "-p",
+            "127.0.0.1:" + ports.get("gateway") + ":80",
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            "-v",
+            root.resolve("build/nginx/nginx.conf") + ":/etc/nginx/nginx.conf:ro",
+            "-v",
+            conf + ":/etc/nginx/conf.d:ro",
+            "nginx:1.28.3-alpine");
+        await(() -> status("gateway", "/session") == 200, "网关到本机回环 UI");
+        for (String path :
+            List.of("/internal/securities/status", "/actuator/health", "/v3/api-docs", "/unknown"))
+          assertEquals(404, status("gateway", path), path);
+        assertEquals(401, status("gateway", "/api/v1/account"));
+        assertEquals(
+            401,
+            probe
+                .send(
+                    HttpRequest.newBuilder(URI.create(base("gateway") + "/api/v1/account"))
+                        .header("Authorization", "Bearer cannot-replace-session")
+                        .header("X-Forwarded-For", "198.51.100.7")
+                        .GET()
+                        .build(),
+                    HttpResponse.BodyHandlers.discarding())
+                .statusCode());
+        assertEquals(403, status("gateway", "/ws?ticket=gateway-log-redaction-sentinel"));
+        assertEquals(
+            403,
+            probe
+                .send(
+                    HttpRequest.newBuilder(URI.create(base("gateway") + "/auth/signin"))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString("{}"))
+                        .build(),
+                    HttpResponse.BodyHandlers.discarding())
+                .statusCode());
+      }
+      var builder =
+          new ProcessBuilder("node", root.resolve("ui/src/test/js/browser.mjs").toString());
+      var env = builder.environment();
+      env.put("SECURITIES_BROWSER_URL", base(gatewayTest() ? "gateway" : "ui"));
+      env.put("SECURITIES_BROWSER_BUYER_PASSWORD", buyerPassword);
+      env.put("SECURITIES_BROWSER_SELLER_PASSWORD", sellerPassword);
+      env.put("SECURITIES_BROWSER_OUTPUT", logs.toString());
+      var process =
+          builder
+              .redirectErrorStream(true)
+              .redirectOutput(logs.resolve("browser.log").toFile())
+              .start();
+      try {
+        assertTrue(process.waitFor(120, TimeUnit.SECONDS), "浏览器测试超时：" + logs);
+        assertEquals(0, process.exitValue(), Files.readString(logs.resolve("browser.log")));
+      } finally {
+        if (process.isAlive()) {
+          process
+              .descendants()
+              .forEach(
+                  child -> {
                     /* 超时只终止本测试 Node 的浏览器子进程，不按进程名称广泛清理。 */
-                  child.destroyForcibly();
-                });
-        process.destroyForcibly();
-        process.waitFor(10, TimeUnit.SECONDS);
+                    child.destroyForcibly();
+                  });
+          process.destroyForcibly();
+          process.waitFor(10, TimeUnit.SECONDS);
+        }
+      }
+    } finally {
+      if (gatewayTest()) {
+        try {
+          docker("logs", container);
+          assertFalse(
+              Files.readString(logs.resolve("gateway-docker.log"))
+                  .contains("gateway-log-redaction-sentinel"),
+              "不能把 WebSocket 查询票据写入访问或错误日志");
+        } finally {
+          docker("rm", "-f", container);
+        }
       }
     }
+  }
+
+  /** 仅显式开关开启隔离网关，普通浏览器验收不要求额外容器。 */
+  private boolean gatewayTest() {
+    return "true".equals(System.getenv("SECURITIES_TEST_GATEWAY"));
+  }
+
+  /** 只管理本方法生成的 UUID 容器，不接触开发网关或数据库容器。 */
+  private void docker(String... args) throws Exception {
+    var command = new ArrayList<String>();
+    command.add("docker");
+    command.addAll(List.of(args));
+    var process =
+        new ProcessBuilder(command)
+            .redirectErrorStream(true)
+            .redirectOutput(
+                ProcessBuilder.Redirect.appendTo(logs.resolve("gateway-docker.log").toFile()))
+            .start();
+    assertTrue(process.waitFor(90, TimeUnit.SECONDS), "隔离网关 Docker 操作超时");
+    assertEquals(0, process.exitValue(), "隔离网关操作失败，查看 gateway-docker.log");
   }
 
   /** JSON 仅在断言内部解析，密码不输出到测试日志。 */

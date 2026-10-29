@@ -1,4 +1,4 @@
-<!-- 启动入口：Docker 运行五项基础设施，Java 可由根目录脚本或 IDEA 启动。 -->
+<!-- 启动入口：Docker 运行基础设施与 Nginx，Java 可由根目录脚本或 IDEA 启动。 -->
 # Stock Exchange
 
 Java 17 / Spring Boot 模拟证券交易所雏形，持续优化中。支持五只虚构股票兑 USD、共享资金账户、分证券持仓、撮合清算、事件与快照恢复、行情和推送。不用于真实资金交易。
@@ -15,7 +15,7 @@ Java 17 / Spring Boot 模拟证券交易所雏形，持续优化中。支持五�
 docker compose --env-file .env.securities up -d --wait
 ```
 
-只有五个容器，名称固定：`mysql`、`redis`、`kafka`、`grafana`、`prometheus`。没有 Java 应用容器或迁移任务容器。
+六个容器名称固定：`mysql`、`redis`、`kafka`、`grafana`、`prometheus`、`nginx`。没有 Java 应用容器或迁移任务容器。Nginx 为统一入口，HTTP 经 UI 代理、WebSocket 转 Push，内部及管理路径不公开，详见 [网关说明](docs/nginx.md)。
 
 Docker Desktop 就绪并填写本地配置后，在项目根目录执行一键启动（容器可尚未开启）：
 
@@ -23,7 +23,7 @@ Docker Desktop 就绪并填写本地配置后，在项目根目录执行一键�
 .\start.ps1
 ```
 
-脚本先检查五个基础容器，均运行且健康就跳过，否则用现有 Compose 创建缺少的容器、启动已停止的容器并等待健康，不重建已有容器或删除数据卷。然后按需打包，先验证 Config 的六份客户端配置，再逐个等待其他应用就绪，全部成功后自动打开 UI。支持 Windows PowerShell 5.1 / PowerShell 7。若执行策略阻止脚本，可仅对本次调用使用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1`，无需更改系统策略。
+脚本先检查六个容器，均健康就跳过，否则用现有 Compose 补齐并等待，不重建已有容器或删除数据卷。然后按需打包，先验证 Config 的六份客户端配置，再逐个等待应用及网关会话链路就绪，成功后打开网关页面。支持 PowerShell 5.1 / 7；若执行策略阻止，可用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1`，无需更改系统策略。
 
 已有 JAR 且源码、资源、POM、打包 SQL 未变化时自动跳过 Maven；首次接管已有产物先核对时间，之后记录输入和 JAR 双指纹。`-Rebuild` 强制干净重建；`-SkipBuild` 显式使用现有 JAR，不保证与源码一致；`-NoBrowser` 不打开浏览器。日志、构建指纹和进程记录在被 Git 忽略的 `build/.local-run/`。重复执行复用本项目 JAR 进程；若需要重建但 Java 仍运行则拒绝覆盖，请先停止旧应用。未知端口占用（包括无法确认归属的 IDEA 实例）会明确报错，不自动停止。
 
@@ -45,9 +45,11 @@ Windows 下使用进程终止，不保证 JVM 优雅关闭；不要把批量结�
 
 业务应用直接读取 `build/.env.securities`，再从 Config Server 读取公共配置；无需在启动脚本中导出密码。MySQL 容器创建数据库，Java 应用首次连接时自动执行全部 Flyway 迁移（含快照表），重复启动只校验版本。Kafka 在自己的容器内创建并校验 Topic。
 
-页面：[localhost:8100](http://localhost:8100)；Grafana：[localhost:3000](http://localhost:3000)；Prometheus：[localhost:9090](http://localhost:9090)。
+交易入口：[localhost:8080](http://localhost:8080)；本机 UI 调试端口仍为 8100（默认推送通过网关）；Grafana：[localhost:3000](http://localhost:3000)；Prometheus：[localhost:9090](http://localhost:9090)。当前仅本地 HTTP，不是公网生产部署。
 
 ## 账户与数据
+
+普通注册账户初始余额为零，登录后点击“模拟入金 / 入金记录”主动增加模拟 USD。默认单笔 1～100000 USD、每日累计 500000 USD（UTC，含待确认申请）；已有用户也可使用，不重置资产或历史。入金通过持久申请、事务发件箱及原交易引擎完成，详见 [模拟入金说明](docs/deposits.md)。不涉及真实支付。
 
 全新环境设置 `SECURITIES_DEMO_ENABLED=true` 后自动创建 `user1@example.com` 至 `user10@example.com`，名称“用户一”至“用户十”，密码分别取配置中的十个用户密码。初始化通过真实事件链配资、挂单、撮合，可重复启动且不会重复配资。
 

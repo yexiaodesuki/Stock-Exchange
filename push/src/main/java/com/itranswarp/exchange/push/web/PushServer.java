@@ -61,7 +61,9 @@ public final class PushServer implements AutoCloseable {
             request.response().setStatusCode(503).end();
             return;
           }
-          if (!origins.contains(request.getHeader("Origin"))) {
+          // 缺失 Origin 也必须明确拒绝，不能对不可变集合传 null 而让握手悬挂。
+          String origin = request.getHeader("Origin");
+          if (origin == null || !origins.contains(origin)) {
             request.response().setStatusCode(403).end();
             return;
           }

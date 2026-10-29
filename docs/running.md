@@ -1,4 +1,4 @@
-<!-- 五容器开发环境说明：保留已有数据，Java 可通过根目录脚本或 IDEA 启动。 -->
+<!-- 六容器本地网关环境说明：保留数据，Java 通过根目录脚本或 IDEA 启动。 -->
 # 运行与验证
 
 ## 文件与首次配置
@@ -18,7 +18,7 @@ docker compose --env-file .env.securities up -d --wait
 docker compose --env-file .env.securities ps
 ```
 
-五个固定容器名不能在同一个 Docker 引擎中重复。因此本配置面向一个开发环境，不支持同机直接并行启动第二套同名栈。
+六个固定容器名不能在同一个 Docker 引擎中重复。因此本配置面向一个开发环境，不支持同机直接并行启动第二套同名栈。已有手工 nginx 须先确认用途，启动脚本不会删除或接管它。
 
 | 容器 | 宿主机端口 | 数据卷 |
 |---|---|---|
@@ -26,6 +26,7 @@ docker compose --env-file .env.securities ps
 | redis | 16379 | stock-exchange-securities_redis-data |
 | kafka | 19092 | stock-exchange-securities_kafka-data |
 | grafana | 3000 | stock-exchange-monitoring_grafana-data |
+| nginx | 8080 | 无业务数据卷，配置只读挂载 |
 | prometheus | 9090 | stock-exchange-monitoring_prometheus-data |
 
 全部发布到 127.0.0.1。保留既有卷名是为了保留证券数据和监控数据，Compose 对跨项目复用旧监控卷的标签警告不表示数据损坏。新克隆机器没有这些卷时会自动创建，不需要手工 docker volume create。
@@ -50,7 +51,7 @@ Kafka 主进程在同一个容器中受 shell 监督；就绪后执行幂等 Top
 
 支持 Windows PowerShell 5.1 和 PowerShell 7。脚本带 UTF-8 BOM，避免 5.1 将中文误读为其他编码。若本机执行策略拦截，可使用 powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1，仅作用于此次进程，不修改系统执行策略。
 
-脚本读取本 Compose 项目五个容器的名称、运行状态和健康状态，不展开包含密码的配置。都健康时完全跳过 Compose up；否则执行现有 Compose 的 up -d --wait --wait-timeout 180 --no-recreate，创建缺少的容器、启动停止的容器并等待健康，不自动重建已有容器或删除数据卷。Docker Desktop 不可连接时明确失败，不自动启动桌面程序。运行但不健康的容器若不能自行恢复，会超时失败，而不是擅自重启数据库。修改 Compose 或容器环境后需单独确认并执行环境更新，不能依赖该跳过逻辑自动重建。
+脚本读取本 Compose 项目六个容器的名称、运行状态和健康状态，不展开包含密码的配置。都健康时跳过 Compose up；否则执行 up -d --wait --wait-timeout 180 --no-recreate，补齐并等待，不重建已有容器或删除卷。Docker Desktop 不可连接时明确失败。运行但不健康的容器会超时失败，不擅自重启数据库。修改挂载的 Nginx 配置须验证并 reload；修改容器环境须单独确认并更新，不能依赖跳过逻辑自动重建。网关健康仅说明进程存活，Java 全就绪后还会通过网关检查 /session，随后打开 localhost:8080。网络接入、安全边界及网关隔离验收见 [Nginx 说明](nginx.md)。
 
 打包输入包括九个模块及 build 的 POM、src/main 源码与资源，以及 common 打包使用的 build/sql/securities/V*.sql。不含外置 config-repo、私密配置和日志。已有构建第一次按文件时间判断是否可接管，之后在 build/.local-run/build-state.json 保存输入及七个 JAR 的内容指纹；未变化自动跳过，缺 JAR、输入变化、产物不匹配则运行 Maven clean package -DskipTests。这个打包步骤不代表执行了测试。-Rebuild 强制重建，-SkipBuild 强制使用旧产物，两者互斥。需要构建而旧 Java 应用仍运行时明确拒绝，请先停止它们，不能覆盖运行中的 JAR。
 

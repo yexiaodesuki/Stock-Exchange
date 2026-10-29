@@ -1,4 +1,4 @@
-/* UI 安全过滤器：独立维护 CSP、CSRF 和请求大小边界，页面与接口不改变。 */
+/* UI 安全过滤器：维护 CSP、CSRF 和请求大小边界，允许固定同源网关 WebSocket 路径。 */
 package com.itranswarp.exchange.ui.web;
 
 import jakarta.servlet.*;
@@ -9,10 +9,15 @@ import java.util.Set;
 public final class UISecurityFilter implements Filter {
   private final String connectOrigin;
 
-  /** 只接受配置中的明确 WebSocket 地址，保留原地址校验。 */
+  /** 网关只允许固定 /ws 相对路径；独立运行仍可显式使用受校验的绝对地址。 */
   public UISecurityFilter(String websocket) {
+    if ("/ws".equals(websocket)) {
+      connectOrigin = "";
+      return;
+    }
     URI ws = URI.create(websocket);
-    if (!Set.of("ws", "wss").contains(ws.getScheme())
+    if (ws.getScheme() == null
+        || !Set.of("ws", "wss").contains(ws.getScheme())
         || ws.getHost() == null
         || ws.getRawQuery() != null
         || ws.getFragment() != null

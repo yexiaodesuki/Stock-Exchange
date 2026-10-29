@@ -9,6 +9,8 @@ export function dollars(value){return `${value/100n}.${(value%100n).toString().p
 export function decimal(value,scale=2){const match=/^(\d+)(?:\.(\d+))?$/.exec(String(value));if(!match)throw new Error('服务端数值格式错误');const fraction=match[2]||'';if(/[1-9]/.test(fraction.slice(scale)))throw new Error('服务端数值精度错误');return match[1]+(scale?'.'+fraction.slice(0,scale).padEnd(scale,'0'):'');}
 /** 汇总同一余额的可用与冻结，仅操作整数分或整数股。 */
 export function total(available,frozen,scale=2){const a=decimal(available,scale).replace('.',''),b=decimal(frozen,scale).replace('.','');const value=BigInt(a)+BigInt(b);return scale?dollars(value):value.toString();}
+/** 固定网关路径跟随当前站点选择 ws/wss；仍兼容测试和独立部署的显式绝对地址。 */
+export function websocketEndpoint(endpoint,page){const base=new URL(page);if(endpoint==='/ws'){base.pathname='/ws';base.search='';base.hash='';base.protocol=base.protocol==='https:'?'wss:':'ws:';return base;}const url=new URL(endpoint);if(!['ws:','wss:'].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw new Error('推送地址无效');return url;}
 export class Selection {
   /** 页面代次只在切股时递增，HTTP 旧响应无法写入新股票。 */
   constructor(){this.id=null;this.version=0;}

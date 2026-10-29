@@ -1,4 +1,4 @@
-# 唯一基础设施入口：Java 应用在 IDEA 运行；不创建应用或一次性任务容器。
+# 唯一容器入口：基础设施及 Nginx 在 Docker，Java 在宿主机由脚本或 IDEA 运行。
 name: stock-exchange-securities
 x-runtime: &runtime
   restart: unless-stopped
@@ -6,6 +6,20 @@ x-runtime: &runtime
     driver: json-file
     options: {max-size: "10m", max-file: "3"}
 services:
+  nginx:
+    <<: *runtime
+    image: nginx:1.28.3-alpine
+    container_name: nginx
+    ports: ["127.0.0.1:${SEC_GATEWAY_PORT:-8080}:80"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/gateway-health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
   mysql:
     <<: *runtime
     image: mysql:8.0.45

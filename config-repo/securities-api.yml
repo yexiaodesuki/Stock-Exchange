@@ -4,3 +4,10 @@ server:
 management:
   server:
     port: ${SECURITIES_API_MANAGEMENT_PORT:18101}
+securities:
+  deposits:
+    # 仅模拟资金，真实部署必须关闭；无银行卡或支付回调。
+    enabled: ${SECURITIES_DEPOSITS_ENABLED:true}
+    minimum: 1.00
+    maximum: 100000.00
+    daily: 500000.00

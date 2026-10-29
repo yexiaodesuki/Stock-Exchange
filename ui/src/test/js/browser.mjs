@@ -1,4 +1,4 @@
-/* 真实 Chromium 页面验收：隔离买卖 Cookie、五证券切换、挂单成交撤单及未决请求刷新恢复。 */
+/* 真实 Chromium 验收：隔离身份、交易行情与模拟入金，验证丢响应刷新和存储不可用的安全行为。 */
 import {chromium} from 'playwright';
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -49,5 +49,18 @@ try{
   await a.screenshot({path:path.join(process.env.SECURITIES_BROWSER_OUTPUT,'securities-ui.png'),fullPage:true});
   await a.setViewportSize({width:390,height:844});await pause(200);assert.ok(await a.locator('#cash').isVisible());await a.screenshot({path:path.join(process.env.SECURITIES_BROWSER_OUTPUT,'securities-ui-mobile.png'),fullPage:true});
   const resources=await a.evaluate(()=>performance.getEntriesByType('resource').filter(e=>!e.name.startsWith(location.origin)&&!e.name.startsWith('data:')).map(e=>e.name));assert.deepEqual(resources,[]);
-  assert.deepEqual(errors,[]);console.log('浏览器验收通过：双身份、五证券 K线、切股隔离、Maker 价格清算、撤单、刷新幂等、重连、桌面与移动布局。短暂追赶响应：'+recovering.length+'，未决查询 404：'+pendingLookups.length+'，主动断网响应：'+offlineResponses.length+'；最终稳定周期无持续错误。');
+  // 老用户从页面主动入金；响应丢失后刷新仍使用原键，只到账一次。
+  await a.setViewportSize({width:1440,height:1080});
+  const cashBefore=money((await account(a)).cash.available);
+  let depositSent=false;await a.route('**/api/v1/deposits',async route=>{if(route.request().method()!=='POST'){await route.continue();return;}const response=await route.fetch();depositSent=true;await pause(1200);try{await route.fulfill({response});}catch(aborted){/* 刷新丢失响应后依赖相同幂等键恢复。 */}});
+  await a.locator('#deposit-open').click();await until(async()=>!(await a.locator('#deposit-submit').isDisabled()),'入金策略已加载');
+  // 浏览器不能持久保存原键时禁止发送，避免刷新后无法确定是否重复入金。
+  await a.evaluate(()=>{window.savedDepositStorage=Storage.prototype.setItem;Storage.prototype.setItem=function(key,value){if(key.startsWith('securities.deposit.'))throw new Error('测试：浏览器存储不可用');return window.savedDepositStorage.call(this,key,value);};});
+  await a.locator('#deposit-amount').fill('1234.56');await a.locator('#deposit-submit').click();await until(async()=>(await a.locator('#deposit-status').innerText()).includes('浏览器存储不可用'),'存储不可用时明确拒绝');assert.equal(depositSent,false);
+  await a.evaluate(()=>{Storage.prototype.setItem=window.savedDepositStorage;delete window.savedDepositStorage;});
+  await a.locator('#deposit-submit').click();await until(async()=>depositSent,'入金申请已登记');await a.reload();await a.unroute('**/api/v1/deposits');await a.locator('#terminal').waitFor({state:'visible'});
+  await until(async()=>money((await account(a)).cash.available)===cashBefore+123456n,'刷新后模拟入金只到账一次');
+  await a.locator('#deposit-open').click();await until(async()=>(await a.locator('#deposit-history').innerText()).includes('已到账'),'本人入金记录');
+  const deposits=await a.evaluate(async()=>{const r=await fetch('/api/v1/deposits');return r.json();});assert.equal(deposits.filter(d=>d.amount==='1234.56').length,1);await a.locator('#deposit-close').click();
+  assert.deepEqual(errors,[]);console.log('浏览器验收通过：双身份、五证券行情、交易撤单、恢复重连、模拟入金和丢响应刷新幂等。短暂追赶响应：'+recovering.length+'，未决查询 404：'+pendingLookups.length+'，主动断网响应：'+offlineResponses.length+'；最终稳定周期无持续错误。');
 }finally{await buyer.close();await seller.close();await browser.close();}

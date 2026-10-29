@@ -5,4 +5,4 @@ management:
   server:
     port: ${SECURITIES_PUSH_MANAGEMENT_PORT:18106}
 securities:
-  origins: ${SECURITIES_ALLOWED_ORIGINS:http://localhost:8100,http://127.0.0.1:8100}
+  origins: ${SECURITIES_ALLOWED_ORIGINS:http://localhost:${SEC_GATEWAY_PORT:8080},http://127.0.0.1:${SEC_GATEWAY_PORT:8080},http://localhost:8100,http://127.0.0.1:8100}

@@ -12,6 +12,43 @@ import org.springframework.context.annotation.Bean;
 
 @org.springframework.context.annotation.Configuration(proxyBeanMethods = false)
 public class ApiConfiguration {
+  /** 默认关闭模拟开关，本地配置显式开启，额度不可由浏览器覆盖。 */
+  @Bean
+  DepositPolicy depositPolicy(
+      @Value("${securities.deposits.enabled:false}") boolean enabled,
+      @Value("${securities.deposits.minimum:1.00}") java.math.BigDecimal minimum,
+      @Value("${securities.deposits.maximum:100000.00}") java.math.BigDecimal maximum,
+      @Value("${securities.deposits.daily:500000.00}") java.math.BigDecimal daily) {
+    return new DepositPolicy(enabled,minimum,maximum,daily);
+  }
+
+  /** 显式依赖已迁移目录，后台不得抢在 Flyway 建表前读取发件箱。 */
+  @Bean
+  com.itranswarp.exchange.repository.DepositRepository deposits(DataSource source,SecurityCatalog catalog) {
+    return new com.itranswarp.exchange.repository.DepositRepository(source);
+  }
+
+  /** 使用 UTC 日额度，不随宿主机时区改变。 */
+  @Bean
+  DepositService depositService(com.itranswarp.exchange.repository.DepositRepository deposits,DepositPolicy policy) {
+    return new DepositService(deposits,policy,java.time.Clock.systemUTC());
+  }
+
+  /** 生命周期由 Spring 管理，不增加容器、不绕过定序。 */
+  @Bean(initMethod="start",destroyMethod="close")
+  DepositDispatchService depositDispatcher(com.itranswarp.exchange.repository.DepositRepository deposits,
+      DataSource source,TradingEngineApiProxyService engineProxy,
+      @Value("${securities.kafka-bootstrap}") String bootstrap,
+      @Value("${securities.namespace}") String namespace) {
+    return new DepositDispatchService(deposits,new OutputStore(source),engineProxy,bootstrap,namespace);
+  }
+
+  /** 入金与订单控制器分开，复用现有签名身份服务。 */
+  @Bean
+  com.itranswarp.exchange.web.api.DepositController depositController(ApiAuthenticationService authentication,DepositService service) {
+    return new com.itranswarp.exchange.web.api.DepositController(authentication,service);
+  }
+
   /** 目录严格检查证券数据库。 */
   @Bean
   SecurityCatalog catalog(DataSource source) {
