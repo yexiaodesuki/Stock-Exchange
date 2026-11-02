@@ -1,4 +1,4 @@
-/* 真实 Chromium 验收：隔离身份、交易行情与模拟入金，验证丢响应刷新和存储不可用的安全行为。 */
+/* 真实 Chromium 验收：隔离身份、交易行情及入金助手展示，验证丢响应刷新和存储不可用的安全行为。 */
 import {chromium} from 'playwright';
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -22,6 +22,10 @@ function pause(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
 try{
   const a=await login(buyer,'user1@example.com',process.env.SECURITIES_BROWSER_BUYER_PASSWORD),b=await login(seller,'user2@example.com',process.env.SECURITIES_BROWSER_SELLER_PASSWORD);
   assert.equal(await a.locator('#username').innerText(),'用户一');assert.equal(await b.locator('#username').innerText(),'用户二');
+  // 无模型配置仍可解释本人冻结，随后继续原交易流程验证助手不阻断交易。
+  await a.locator('#assistant-panel summary').click();assert.equal(await a.locator('#assistant-security,#assistant-order,#assistant-deposit').count(),0);await a.locator('#assistant-question').fill('为什么资金冻结');await a.locator('#assistant-submit').click();await until(async()=>(await a.locator('#assistant-message').innerText()).includes('规则说明'),'助手规则降级');assert.match(await a.locator('#assistant-facts').innerText(),/与账户冻结金额一致/);
+  await a.locator('#assistant-question').fill('星河的订单');await a.locator('#assistant-submit').click();await until(async()=>(await a.locator('#assistant-facts').innerText()).includes('星河科技当前有'),'简称查询订单');assert.doesNotMatch(await a.locator('#assistant-facts').innerText(),/青山能源|安康医药/);
+  await a.locator('#assistant-question').fill('我还有多少钱可以用？');await a.locator('#assistant-submit').click();await until(async()=>(await a.locator('#assistant-facts').innerText()).includes('共享 USD 资金'),'口语资金查询');await a.locator('#assistant-panel summary').click();
   for(const [symbol,name] of [['STAR','星河科技'],['GREEN','青山能源'],['CARE','安康医药'],['DAILY','优选消费'],['SAIL','远航工业']]){await select(a,symbol,name);await until(async()=>(await a.locator('#ticks tr').count())===4,'每证券三条演示成交');assert.match(await a.locator('#chart-caption').innerText(),/最新 OHLC/);}
   // 触发多个交错请求，最后的 SAIL 页面不能被 STAR/GREEN 的慢响应覆盖。
   await a.route('**/securities/1001/ticks',async route=>{await pause(700);try{await route.continue();}catch(aborted){/* 快速切股会取消旧请求；已取消路由不能继续发送。 */}});
@@ -53,7 +57,10 @@ try{
   await a.setViewportSize({width:1440,height:1080});
   const cashBefore=money((await account(a)).cash.available);
   let depositSent=false;await a.route('**/api/v1/deposits',async route=>{if(route.request().method()!=='POST'){await route.continue();return;}const response=await route.fetch();depositSent=true;await pause(1200);try{await route.fulfill({response});}catch(aborted){/* 刷新丢失响应后依赖相同幂等键恢复。 */}});
-  await a.locator('#deposit-open').click();await until(async()=>!(await a.locator('#deposit-submit').isDisabled()),'入金策略已加载');
+  // 明确暂停首次历史请求，验证未加载完成时不会出现“可点击但被忙碌状态忽略”的按钮。
+  let historyRequested=false,releaseHistory;const historyGate=new Promise(resolve=>{releaseHistory=resolve;});const historyPattern=/\/api\/v1\/deposits\?/;
+  await a.route(historyPattern,async route=>{historyRequested=true;await historyGate;await route.continue();});
+  await a.locator('#deposit-open').click();await until(async()=>historyRequested,'入金历史请求开始');assert.equal(await a.locator('#deposit-submit').isDisabled(),true,'历史未就绪必须禁用提交');releaseHistory();await until(async()=>!(await a.locator('#deposit-submit').isDisabled()),'入金策略与历史已加载');await a.unroute(historyPattern);
   // 浏览器不能持久保存原键时禁止发送，避免刷新后无法确定是否重复入金。
   await a.evaluate(()=>{window.savedDepositStorage=Storage.prototype.setItem;Storage.prototype.setItem=function(key,value){if(key.startsWith('securities.deposit.'))throw new Error('测试：浏览器存储不可用');return window.savedDepositStorage.call(this,key,value);};});
   await a.locator('#deposit-amount').fill('1234.56');await a.locator('#deposit-submit').click();await until(async()=>(await a.locator('#deposit-status').innerText()).includes('浏览器存储不可用'),'存储不可用时明确拒绝');assert.equal(depositSent,false);
@@ -62,5 +69,9 @@ try{
   await until(async()=>money((await account(a)).cash.available)===cashBefore+123456n,'刷新后模拟入金只到账一次');
   await a.locator('#deposit-open').click();await until(async()=>(await a.locator('#deposit-history').innerText()).includes('已到账'),'本人入金记录');
   const deposits=await a.evaluate(async()=>{const r=await fetch('/api/v1/deposits');return r.json();});assert.equal(deposits.filter(d=>d.amount==='1234.56').length,1);await a.locator('#deposit-close').click();
+  // 必须在真实入金之后提问，空列表不会触发日期转换缺陷。
+  await a.locator('#assistant-panel summary').click();await a.locator('#assistant-question').fill('我的入金情况');await a.locator('#assistant-submit').click();
+  await until(async()=>(await a.locator('#assistant-facts').innerText()).includes('1234.56'),'入金后助手显示真实金额');
+  assert.match(await a.locator('#assistant-facts').innerText(),/已到账/);assert.match(await a.locator('#assistant-facts').innerText(),/模拟入金（USD）/);
   assert.deepEqual(errors,[]);console.log('浏览器验收通过：双身份、五证券行情、交易撤单、恢复重连、模拟入金和丢响应刷新幂等。短暂追赶响应：'+recovering.length+'，未决查询 404：'+pendingLookups.length+'，主动断网响应：'+offlineResponses.length+'；最终稳定周期无持续错误。');
 }finally{await buyer.close();await seller.close();await browser.close();}

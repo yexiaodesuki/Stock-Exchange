@@ -77,8 +77,8 @@ public final class ApiProxyService {
   /** 仅放行本人模拟入金和证券接口，不暴露通用配资、内部管理和任意转发。 */
   public static boolean allowed(String path, boolean post) {
     return post
-        ? path.matches("/api/v1/(orders|orders/[0-9]+/cancel|ws-ticket|deposits)")
+        ? path.matches("/api/v1/(orders|orders/[0-9]+/cancel|ws-ticket|deposits|assistant/explain)")
         : path.matches(
-            "/api/v1/(securities|securities/[0-9]+/(orderbook|ticks|bars/(sec|min|hour|day))|account|orders|history/orders|orders/[0-9]+/matches|requests/[A-Za-z0-9._:-]+|deposits|deposits/policy|deposits/[a-f0-9-]{36})");
+            "/api/v1/(securities|securities/[0-9]+/(orderbook|ticks|bars/(sec|min|hour|day))|account|orders|history/orders|orders/[0-9]+/matches|requests/[A-Za-z0-9._:-]+|deposits|deposits/policy|deposits/[a-f0-9-]{36}|assistant/status)");
   }
 }

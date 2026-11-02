@@ -47,6 +47,17 @@ public final class InternalTradingEngineApiController {
     return runtime.account(user);
   }
 
+  /** 单次不可变快照过滤本人现金、持仓和活动订单，避免多次 HTTP 查询拼接跨时刻状态。 */
+  @GetMapping("/accounts/{user}/assistant-context")
+  public Object assistantContext(@PathVariable long user) {
+    if(user<=1) throw new IllegalArgumentException("普通用户标识无效");
+    var view=runtime.state();
+    return Map.of("sequenceId",Long.toString(view.sequenceId()),
+        "cash",view.cash().stream().filter(c->c.userId()==user).toList(),
+        "positions",view.positions().stream().filter(p->p.userId()==user).toList(),
+        "orders",view.orders().stream().filter(o->o.userId()==user).toList());
+  }
+
   /** 聚合价量供 API 回源，不包含订单身份。 */
   @GetMapping("/books/{security}")
   public Object book(@PathVariable long security) {

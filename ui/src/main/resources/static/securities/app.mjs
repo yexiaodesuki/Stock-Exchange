@@ -2,6 +2,8 @@
 import {cents,shares,dollars,decimal,total,Selection,websocketEndpoint} from './domain.mjs';
 import {drawChart} from './chart.mjs';
 import {mountDeposits} from './deposits.mjs';
+import {mountAssistant} from './assistant.mjs';
+let stopAssistant=()=>{};
 let stopDeposits=()=>{};
 /** 固定 ID 的局部查找器，不接收用户输入生成 HTML 或选择器。 */
 const $=id=>document.getElementById(id);
@@ -17,7 +19,7 @@ async function api(path,{method='GET',body,key,signal}={}){
   return {value,status:response.status};
 }
 /** 登录失效后停止使用旧私有数据，但不把未决委托说成失败。 */
-function expire(){closed=true;stopDeposits();socket?.close();clearTimeout(connectTimer);clearInterval(refreshTimer);clearInterval(resolveTimer);$('terminal').hidden=true;$('auth').hidden=false;text('username','');text('connection','登录已过期');}
+function expire(){closed=true;stopAssistant();stopDeposits();socket?.close();clearTimeout(connectTimer);clearInterval(refreshTimer);clearInterval(resolveTimer);$('terminal').hidden=true;$('auth').hidden=false;text('username','');text('connection','登录已过期');}
 /** 表格完全用 DOM 文本构建，按钮函数不依赖可执行 HTML 字符串。 */
 function table(id,headers,rows){const parent=$(id);parent.replaceChildren();if(!rows.length){parent.textContent='暂无记录';return;}const table=document.createElement('table'),head=document.createElement('tr');for(const title of headers){const cell=document.createElement('th');cell.textContent=title;head.append(cell);}table.append(head);for(const row of rows){const line=document.createElement('tr');for(const value of row){const cell=document.createElement('td');if(value instanceof Node)cell.append(value);else cell.textContent=value;line.append(cell);}table.append(line);}parent.append(table);}
 /** 操作按钮显式绑定闭包，订单证券在创建时就固定，切换股票不能改写其目标。 */
@@ -79,7 +81,7 @@ async function start(){
   const signup=location.pathname==='/signup';$('auth').hidden=!!user;$('terminal').hidden=!user;$('logout').hidden=!user;
   if(!user){text('auth-title',signup?'创建模拟交易账户':'登录你的交易账户');text('auth-submit',signup?'注册（不自动配资）':'登录');$('name-label').hidden=!signup;$('name').required=signup;text('auth-switch',signup?'已有账户，去登录':'创建账户');$('auth-switch').href=signup?'/signin':'/signup';}
   else{
-    text('username',user.name);catalog=(await api('/api/v1/securities')).value.map(s=>({...s,securityId:String(s.securityId)}));
+    text('username',user.name);stopAssistant=mountAssistant({api,showError});catalog=(await api('/api/v1/securities')).value.map(s=>({...s,securityId:String(s.securityId)}));
     try{const stored=JSON.parse(sessionStorage.getItem('securities.pending.'+user.id)||'[]');pending=Array.isArray(stored)?stored.filter(p=>typeof p.key==='string'&&typeof p.path==='string'&&p.path.startsWith('/api/v1/orders')).slice(0,20):[];}catch(invalid){pending=[];}
     for(const security of catalog){const node=button(security.symbol+' '+security.name,()=>select(security.securityId));node.dataset.id=security.securityId;$('symbols').append(node);}renderPending();await select(catalog[0].securityId);stopDeposits=mountDeposits({api,user,refresh,showError});connect();resolvePending();refreshTimer=setInterval(refresh,5000);resolveTimer=setInterval(resolvePending,2500);
   }

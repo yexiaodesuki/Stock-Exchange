@@ -1,4 +1,4 @@
-/* 六进程隔离验收：交易、模拟入金、强杀恢复和页面；独立 Nginx 验证完整网关路径。 */
+/* 六进程隔离验收：交易、含日期的入金助手查询、强杀恢复和页面；独立 Nginx 验证网关。 */
 package com.itranswarp.exchange.ui.demo;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -450,6 +450,8 @@ class SecuritiesUiProcessTest {
             "--logging.level.root=WARN");
     var env = builder.environment();
     env.put("SECURITIES_JDBC_URL", System.getenv("SECURITIES_PHASE2_DB_URL"));
+    // 无论开发者是否已填模型密钥，隔离联调都禁止访问收费模型。
+    env.put("SEC_ASSISTANT_EXTERNAL_ENABLED", "false");
     env.put("SECURITIES_NAMESPACE", namespace);
     env.put("SECURITIES_AUTH_KEY", key);
     env.put("SEC_KAFKA_BOOTSTRAP_SERVERS", System.getenv("SECURITIES_TEST_BOOTSTRAP"));
@@ -476,7 +478,7 @@ class SecuritiesUiProcessTest {
             .start());
   }
 
-  /** 通过真实 UI/API/Kafka/引擎验证入金、身份隔离，强制终止引擎后资金与流水不重复。 */
+  /** 验证入金、非空记录助手展示及身份隔离；强制终止引擎后资金与流水不重复。 */
   private void verifyDeposits(HttpClient newcomer,HttpClient other) throws Exception {
     String token=tree(send(newcomer,"GET","/session",null,null,null)).path("csrf").asText();
     assertEquals(401,send(client(),"GET","/api/v1/deposits",null,null,null).statusCode());
@@ -491,6 +493,21 @@ class SecuritiesUiProcessTest {
     assertEquals(409,send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"1001\"}",token,"new-user-deposit").statusCode());
     assertEquals(id,tree(send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"1000\"}",token,"new-user-deposit")).path("depositId").asText());
     int eventsBefore=count("SELECT COUNT(*) FROM events"),flowsBefore=count("SELECT COUNT(*) FROM transfer_logs");
+    // 助手只能读本人事实；猜中他人入金编号仍拒绝，解释请求不产生事件。
+    assertEquals(401,send(client(),"GET","/api/v1/assistant/status",null,null,null).statusCode());
+    assertEquals(403,send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"账户余额\"}",null,null).statusCode());
+    assertEquals(200,send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"账户冻结\"}",token,null).statusCode());
+    verifyAssistantDeposits(newcomer,token,1);
+    var detail=send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"入金状态\",\"depositId\":\""+id+"\"}",token,null);
+    assertEquals(200,detail.statusCode(),detail.body());
+    assertEquals("1000.00",tree(detail).path("tables").path(0).path("rows").path(0).path(0).asText());
+    var ownOrders=tree(send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"我的所有订单\"}",token,null));
+    assertEquals(0,ownOrders.path("facts").path("activeOrders").size());
+    assertEquals("0",ownOrders.path("facts").path("finished").path("total").asText());
+    assertEquals("CLARIFICATION",tree(send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"星河和青山的订单\"}",token,null)).path("mode").asText());
+    String otherToken=tree(send(other,"GET","/session",null,null,null)).path("csrf").asText();
+    assertEquals(404,send(other,"POST","/api/v1/assistant/explain","{\"question\":\"入金状态\",\"depositId\":\""+id+"\"}",otherToken,null).statusCode());
+    assertEquals(eventsBefore,count("SELECT COUNT(*) FROM events"));
     var process=processes.remove("trading-engine");process.destroyForcibly();assertTrue(process.waitFor(12,TimeUnit.SECONDS));
     // 引擎不可用期间先持久登记，不能依赖用户再点一次来触发发送。
     var pending=send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"25.00\"}",token,"while-engine-down");
@@ -503,6 +520,24 @@ class SecuritiesUiProcessTest {
     assertEquals(eventsBefore+1,count("SELECT COUNT(*) FROM events"));
     assertEquals(flowsBefore+1,count("SELECT COUNT(*) FROM transfer_logs"));
     assertEquals(2,tree(send(newcomer,"GET","/api/v1/deposits",null,null,null)).size());
+    verifyAssistantDeposits(newcomer,token,2);
+    assertEquals(eventsBefore+1,count("SELECT COUNT(*) FROM events"));
+    assertEquals(flowsBefore+1,count("SELECT COUNT(*) FROM transfer_logs"));
+  }
+
+  /** 真实代理链读取非空入金列表，核对日期、金额和状态，不允许把转换失败当成正常提示。 */
+  private void verifyAssistantDeposits(HttpClient user,String token,int expected) throws Exception {
+    var history=tree(send(user,"GET","/api/v1/deposits",null,null,null));
+    var reply=send(user,"POST","/api/v1/assistant/explain","{\"question\":\"我的入金情况\"}",token,null);
+    assertEquals(200,reply.statusCode(),reply.body());var answer=tree(reply);
+    assertEquals("DEPOSIT",answer.path("intent").asText());
+    assertEquals(expected,answer.path("facts").path("records").size());
+    var rows=answer.path("tables").path(0).path("rows");assertEquals(expected,rows.size());
+    for(int i=0;i<expected;i++){
+      assertTrue(answer.path("facts").path("records").path(i).path("quotaDate").asText().matches("\\d{4}-\\d{2}-\\d{2}"));
+      amount(history.path(i).path("amount").asText(),rows.path(i).path(0));
+      assertEquals("已到账",rows.path(i).path(1).asText());
+    }
   }
 
   /** 只停止本测试拥有的应用，不触碰用户已启动的 Java 服务。 */

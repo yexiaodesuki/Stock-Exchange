@@ -12,6 +12,28 @@ import org.springframework.context.annotation.Bean;
 
 @org.springframework.context.annotation.Configuration(proxyBeanMethods = false)
 public class ApiConfiguration {
+  /** 模型仅在显式开启且完整配置后连接；密钥直接从本地环境读取，不放配置仓库。 */
+  @Bean
+  com.itranswarp.exchange.service.assistant.AiModelClient assistantModel(
+      @Value("${SEC_ASSISTANT_EXTERNAL_ENABLED:false}") boolean enabled,
+      @Value("${SEC_ASSISTANT_ENDPOINT:}") String endpoint,
+      @Value("${SEC_ASSISTANT_MODEL:}") String model,
+      @Value("${SEC_ASSISTANT_API_KEY:}") String key,
+      @Value("${SEC_ASSISTANT_DISABLE_THINKING:auto}") String thinking) {
+    if(!java.util.Set.of("auto","true","false").contains(thinking))throw new IllegalArgumentException("思考配置只能为auto、true或false");
+    if(thinking.equals("auto"))return new com.itranswarp.exchange.service.assistant.HttpAiModelClient(enabled,endpoint,model,key);
+    return new com.itranswarp.exchange.service.assistant.HttpAiModelClient(enabled,endpoint,model,key,Boolean.parseBoolean(thinking));
+  }
+  /** 助手仅装配只读能力，与交易发送服务隔离。 */
+  @Bean
+  com.itranswarp.exchange.service.assistant.AssistantService assistantService(DataSource source,SecurityCatalog catalog,TradingEngineApiProxyService engineProxy,DepositService deposits,com.itranswarp.exchange.service.assistant.AiModelClient model) {
+    return new com.itranswarp.exchange.service.assistant.AssistantService(new com.itranswarp.exchange.service.assistant.AssistantReadService(engineProxy,deposits,new com.itranswarp.exchange.repository.AssistantReadRepository(source)),model,new com.itranswarp.exchange.service.assistant.AssistantSecurityResolver(catalog));
+  }
+  /** 独立控制器复用签名认证，不扩大旧控制器职责。 */
+  @Bean
+  com.itranswarp.exchange.web.api.AssistantController assistantController(com.itranswarp.exchange.service.assistant.AssistantService service,ApiAuthenticationService auth) {
+    return new com.itranswarp.exchange.web.api.AssistantController(service,auth);
+  }
   /** 默认关闭模拟开关，本地配置显式开启，额度不可由浏览器覆盖。 */
   @Bean
   DepositPolicy depositPolicy(
