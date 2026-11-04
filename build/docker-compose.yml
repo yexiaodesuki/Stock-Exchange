@@ -1,4 +1,4 @@
-# 唯一容器入口：基础设施及 Nginx 在 Docker，Java 在宿主机由脚本或 IDEA 运行。
+# 唯一容器入口：核心基础设施与可降级 RAG 在 Docker，Java 在宿主机；模型不进入 Git。
 name: stock-exchange-securities
 x-runtime: &runtime
   restart: unless-stopped
@@ -6,6 +6,38 @@ x-runtime: &runtime
     driver: json-file
     options: {max-size: "10m", max-file: "3"}
 services:
+  chroma:
+    <<: *runtime
+    image: chromadb/chroma:1.0.20
+    container_name: chroma
+    ports: ["127.0.0.1:${SEC_CHROMA_PORT:-18080}:8000"]
+    environment:
+      ANONYMIZED_TELEMETRY: 'false'
+    volumes: ["chroma-data:/data"]
+    healthcheck:
+      test: ["CMD", "bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/8000; printf 'GET /api/v2/heartbeat HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3; read -r line <&3; [[ \"$$line\" == *' 200 '* ]]"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+  embedding:
+    <<: *runtime
+    build: ./rag/embedding
+    container_name: embedding
+    ports: ["127.0.0.1:${SEC_EMBEDDING_PORT:-18081}:8081"]
+    environment:
+      MODEL_DOWNLOAD: ${SEC_RAG_MODEL_DOWNLOAD:-true}
+    volumes:
+      - embedding-models:/models
+      - type: bind
+        source: ${SEC_RAG_MODEL_SOURCE:-./.rag-model-source}
+        target: /models-source
+        read_only: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
   nginx:
     <<: *runtime
     image: nginx:1.28.3-alpine
@@ -133,6 +165,8 @@ services:
       retries: 20
 # 明确保留已有卷名，容器重命名不等于换数据库；可用环境变量为测试指定全新卷。
 volumes:
+  chroma-data: {name: "${SEC_CHROMA_VOLUME:-stock-exchange-securities_chroma-data}"}
+  embedding-models: {name: "${SEC_EMBEDDING_VOLUME:-stock-exchange-securities_embedding-models}"}
   mysql-data: {name: "${SEC_MYSQL_VOLUME:-stock-exchange-securities_mysql-data}"}
   redis-data: {name: "${SEC_REDIS_VOLUME:-stock-exchange-securities_redis-data}"}
   kafka-data: {name: "${SEC_KAFKA_VOLUME:-stock-exchange-securities_kafka-data}"}

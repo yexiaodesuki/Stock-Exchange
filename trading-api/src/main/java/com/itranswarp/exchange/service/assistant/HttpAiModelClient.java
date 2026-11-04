@@ -1,4 +1,4 @@
-/* 有界模型连接：兼容 chat/completions JSON；只发问题文本，未启用时不发网络请求。 */
+/* 有界模型连接：兼容 chat/completions，仅分类本人查询、行情和知识问题，不发送业务数据。 */
 package com.itranswarp.exchange.service.assistant;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -52,7 +52,7 @@ public final class HttpAiModelClient implements AiModelClient {
   /** 纯请求构造便于用假供应商测试扩展参数，不调用真实接口。 */
   Map<String,Object> requestBody(String question){
     var body=new java.util.LinkedHashMap<String,Object>(Map.of("model",model,"max_tokens",64,"messages",List.of(
-        Map.of("role","system","content","仅分类用户问题，输出一个词：ACCOUNT, FREEZE, ORDER, DEPOSIT, UNSUPPORTED。写操作、他人账户、行情预测一律 UNSUPPORTED。不得输出数字、解释或工具调用。"),
+        Map.of("role","system","content","仅分类用户问题，输出一个词：ACCOUNT, FREEZE, ORDER, DEPOSIT, MARKET, KNOWLEDGE, UNSUPPORTED。ACCOUNT账户余额持仓；FREEZE本人冻结；ORDER本人订单；DEPOSIT本人入金记录；MARKET本系统公开成交摘要；KNOWLEDGE交易规则和操作文档，例如如何充值或限价单规则。写操作、他人账户、价格预测一律UNSUPPORTED。不得输出数字、解释或工具调用。"),
         Map.of("role","user","content",question))));
     if(disableThinking)body.put("thinking",Map.of("type","disabled"));
     return body;

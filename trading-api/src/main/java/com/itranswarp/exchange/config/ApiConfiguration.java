@@ -1,4 +1,4 @@
-/* ApiConfiguration：集中装配本应用服务、资源生命周期与健康检查，启动入口不承载业务。 */
+/* ApiConfiguration：装配交易查询、只读行情与知识助手、资源生命周期和健康检查，入口不承载业务。 */
 package com.itranswarp.exchange.config;
 
 import com.itranswarp.exchange.securities.SecurityCatalog;
@@ -24,10 +24,49 @@ public class ApiConfiguration {
     if(thinking.equals("auto"))return new com.itranswarp.exchange.service.assistant.HttpAiModelClient(enabled,endpoint,model,key);
     return new com.itranswarp.exchange.service.assistant.HttpAiModelClient(enabled,endpoint,model,key,Boolean.parseBoolean(thinking));
   }
-  /** 助手仅装配只读能力，与交易发送服务隔离。 */
+  /** 助手仅装配只读能力；知识库只加载固定资源，摘要限制通过 Config Server 集中管理。 */
   @Bean
-  com.itranswarp.exchange.service.assistant.AssistantService assistantService(DataSource source,SecurityCatalog catalog,TradingEngineApiProxyService engineProxy,DepositService deposits,com.itranswarp.exchange.service.assistant.AiModelClient model) {
-    return new com.itranswarp.exchange.service.assistant.AssistantService(new com.itranswarp.exchange.service.assistant.AssistantReadService(engineProxy,deposits,new com.itranswarp.exchange.repository.AssistantReadRepository(source)),model,new com.itranswarp.exchange.service.assistant.AssistantSecurityResolver(catalog));
+  com.itranswarp.exchange.service.assistant.AssistantService assistantService(DataSource source,SecurityCatalog catalog,TradingEngineApiProxyService engineProxy,DepositService deposits,com.itranswarp.exchange.service.assistant.AiModelClient model,
+      @Value("${securities.assistant.market.default-hours:24}") int defaultHours,
+      @Value("${securities.assistant.market.max-days:7}") int maxDays,
+      @Value("${securities.assistant.market.max-trades-per-security:10000}") int maxTrades,
+      com.itranswarp.exchange.service.assistant.AssistantKnowledgeService knowledge) {
+    return new com.itranswarp.exchange.service.assistant.AssistantService(new com.itranswarp.exchange.service.assistant.AssistantReadService(engineProxy,deposits,new com.itranswarp.exchange.repository.AssistantReadRepository(source)),model,new com.itranswarp.exchange.service.assistant.AssistantSecurityResolver(catalog),
+        new com.itranswarp.exchange.service.assistant.AssistantMarketService(new com.itranswarp.exchange.repository.AssistantMarketRepository(source,maxTrades),catalog),
+        knowledge,
+        new com.itranswarp.exchange.service.assistant.AssistantTimeRangeResolver(java.time.Clock.systemUTC(),defaultHours,maxDays));
+  }
+  /** 文档只加载白名单资源，构造不连接RAG依赖。 */
+  @Bean
+  com.itranswarp.exchange.service.assistant.rag.KnowledgeDocumentService knowledgeDocuments(DepositService deposits){return new com.itranswarp.exchange.service.assistant.rag.KnowledgeDocumentService(deposits.policy());}
+  /** CPU嵌入与Chroma在回环端口，地址经Config Server配置，不由用户问题指定。 */
+  @Bean
+  com.itranswarp.exchange.service.assistant.rag.EmbeddingClient embeddings(@Value("${securities.assistant.rag.embedding-url:http://127.0.0.1:18081}")String url){return new com.itranswarp.exchange.service.assistant.rag.HttpEmbeddingClient(url);}
+  /** 向量库只保存公开知识索引，不参与交易数据库事务。 */
+  @Bean
+  com.itranswarp.exchange.repository.ChromaKnowledgeRepository knowledgeVectors(@Value("${securities.assistant.rag.chroma-url:http://127.0.0.1:18080}")String url){return new com.itranswarp.exchange.repository.ChromaKnowledgeRepository(url);}
+  /** 后台建库的失败不能导致API和交易启动失败；关闭时仅停止自己的线程。 */
+  @Bean(initMethod="start",destroyMethod="close")
+  com.itranswarp.exchange.service.assistant.rag.KnowledgeIndexService knowledgeIndex(@Value("${securities.assistant.rag.enabled:true}")boolean enabled,com.itranswarp.exchange.service.assistant.rag.KnowledgeDocumentService documents,com.itranswarp.exchange.service.assistant.rag.EmbeddingClient embedding,com.itranswarp.exchange.repository.ChromaKnowledgeRepository vectors){return new com.itranswarp.exchange.service.assistant.rag.KnowledgeIndexService(enabled,documents,embedding,vectors);}
+  /** 生成独立预算，默认沿用已显式开启的聊天配置，可单独关闭且不影响分类。 */
+  @Bean
+  com.itranswarp.exchange.service.assistant.rag.KnowledgeAnswerClient knowledgeAnswer(
+      @Value("${SEC_RAG_GENERATION_ENABLED:${SEC_ASSISTANT_EXTERNAL_ENABLED:false}}")boolean enabled,
+      @Value("${SEC_ASSISTANT_ENDPOINT:}")String endpoint,@Value("${SEC_ASSISTANT_MODEL:}")String model,
+      @Value("${SEC_ASSISTANT_API_KEY:}")String key,@Value("${SEC_ASSISTANT_DISABLE_THINKING:auto}")String thinking){return new com.itranswarp.exchange.service.assistant.rag.HttpKnowledgeAnswerClient(enabled,endpoint,model,key,thinking);}
+  /** 原文、向量召回与生成按职责装配；配置关闭时不调用嵌入或生成。 */
+  @Bean
+  com.itranswarp.exchange.service.assistant.AssistantKnowledgeService knowledgeService(
+      com.itranswarp.exchange.service.assistant.rag.KnowledgeDocumentService documents,
+      com.itranswarp.exchange.service.assistant.rag.KnowledgeIndexService index,
+      com.itranswarp.exchange.service.assistant.rag.EmbeddingClient embedding,
+      com.itranswarp.exchange.repository.ChromaKnowledgeRepository vectors,
+      com.itranswarp.exchange.service.assistant.rag.KnowledgeAnswerClient answer,
+      @Value("${securities.assistant.rag.enabled:true}")boolean enabled,
+      @Value("${securities.assistant.rag.max-distance:0.46}")double distance,
+      @Value("${securities.assistant.knowledge.max-sections:3}")int sections){
+    var retrieval=enabled?new com.itranswarp.exchange.service.assistant.rag.KnowledgeRetrievalService(documents,index,embedding,vectors,sections,distance):null;
+    return new com.itranswarp.exchange.service.assistant.AssistantKnowledgeService(documents,index,retrieval,answer,sections);
   }
   /** 独立控制器复用签名认证，不扩大旧控制器职责。 */
   @Bean

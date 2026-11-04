@@ -1,0 +1,9 @@
+# 本地嵌入服务固定依赖；仅 CPU 推理，不安装重排序或聊天模型。
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+sentence-transformers==3.4.1
+transformers==4.48.3
+huggingface-hub==0.28.1
+tokenizers==0.21.0
+safetensors==0.5.2
+numpy==1.26.4

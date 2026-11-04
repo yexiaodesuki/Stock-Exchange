@@ -29,7 +29,7 @@ public final class ApiProxyService {
     this.demo = demo;
   }
 
-  /** 保留原状态码、请求限制、超时和初始化写保护。 */
+  /** 保留交易九秒超时；只有助手生成允许十五秒，不将RAG慢请求扩散到交易接口。 */
   public ResponseEntity<byte[]> proxy(HttpServletRequest request) throws Exception {
     String path = request.getRequestURI();
     boolean post = "POST".equals(request.getMethod());
@@ -44,7 +44,7 @@ public final class ApiProxyService {
       throw new ResponseStatusException(HttpStatus.BAD_REQUEST);
     var builder =
         HttpRequest.newBuilder(URI.create(api + path + (query == null ? "" : "?" + query)))
-            .timeout(Duration.ofSeconds(9))
+            .timeout(Duration.ofSeconds(path.equals("/api/v1/assistant/explain")?15:9))
             .header("Accept", "application/json");
     if (user != null)
       builder.header(

@@ -1,4 +1,4 @@
-/* 确定性结论与事实卡片：支持入金日期类型；服务器生成金额、名称和状态，模型不能编造业务事实。 */
+/* 确定性结论与事实卡片：支持入金日期、行情统计和知识出处，不展示模型编造的业务事实。 */
 package com.itranswarp.exchange.service.assistant;
 import com.fasterxml.jackson.databind.*;
 import java.math.BigDecimal;
@@ -25,6 +25,13 @@ public final class AssistantPresentation {
   /** 直接回答金额、订单数量与入金状态，明确历史展示窗口和来源时点。 */
   public Result render(AssistantRules.Intent intent,Map<String,Object> facts,AssistantSecurityResolver.Selection selection){
     JsonNode data=json.valueToTree(facts);var highlights=new ArrayList<String>();var tables=new ArrayList<Table>();String scope=selection.label();
+    if(intent==AssistantRules.Intent.MARKET)return market(data);
+    if(intent==AssistantRules.Intent.KNOWLEDGE){
+      if(!data.path("answer").asText().isBlank())highlights.add(data.path("answer").asText());
+      else for(var row:data.path("sources"))highlights.add(row.path("excerpt").asText());
+      if(highlights.isEmpty())highlights.add("项目知识库没有收录足够依据，暂时无法回答；不会使用模型常识猜测本项目规则。");
+      return new Result(AssistantRules.explain(intent),highlights,List.of());
+    }
     if(intent==AssistantRules.Intent.DEPOSIT){
       var rows=new ArrayList<List<String>>();var values=json.createArrayNode();if(data.has("record"))values.add(data.get("record"));else data.path("records").forEach(values::add);int pending=0,success=0;
       for(var row:values){String state=row.path("status").asText();if(state.equals("PENDING"))pending++;if(state.equals("SUCCEEDED"))success++;rows.add(List.of(number(row.path("amount"),true),status(state),row.path("createdAt").asText(),state.equals("REJECTED")?row.path("reason").asText():""));}
@@ -44,5 +51,19 @@ public final class AssistantPresentation {
       if(data.has("history")){var row=data.path("history").path("order");tables.add(new Table("所选历史委托",List.of("证券","方向","限价 USD","原股数","未成交股数","状态"),List.of(orderRow(row,false))));}
     }
     return new Result(AssistantRules.explain(intent),highlights,tables);
+  }
+  /** 公开行情不附带本人资金；零成交与单笔成交分别说明，旧价格单独标成范围外数据。 */
+  private Result market(JsonNode data){
+    var highlights=new ArrayList<String>();var tables=new ArrayList<Table>();
+    String range=data.path("range").asText();highlights.add("统计范围："+range+"；UTC "+java.time.Instant.ofEpochMilli(data.path("from").asLong())+" 至 "+java.time.Instant.ofEpochMilli(data.path("to").asLong())+"（左闭右开）。");
+    for(var row:data.path("markets")){
+      String name=row.path("name").asText();
+      if(row.path("state").asText().equals("NO_TRADES")){
+        highlights.add(name+"在该范围内无成交，不能生成区间趋势。"+(row.has("lastTime")?"范围外最近成交："+java.time.Instant.ofEpochMilli(row.path("lastTime").asLong())+"，价格 "+row.path("lastPrice").asText()+" USD（不计入本次统计）。":"本系统尚无该证券的成交记录。"));continue;
+      }
+      highlights.add(name+"共 "+row.path("count").asText()+" 笔成交，"+row.path("volume").asText()+" 股，成交金额 "+row.path("amount").asText()+" USD。"+(row.path("state").asText().equals("ONE_TRADE")?"只有一笔成交，不足以判断趋势。":"区间首末价变化 "+row.path("changePercent").asText()+"%（不是日涨跌幅；展示百分比四舍五入至两位）。"));
+      tables.add(new Table(name+"成交统计",List.of("首笔价格 USD","末笔价格 USD","最高价 USD","最低价 USD","最后成交时间"),List.of(List.of(row.path("first").asText(),row.path("last").asText(),row.path("high").asText(),row.path("low").asText(),row.path("lastTime").asText()))));
+    }
+    return new Result(AssistantRules.explain(AssistantRules.Intent.MARKET),highlights,tables);
   }
 }

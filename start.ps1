@@ -77,6 +77,34 @@ function Ensure-ExchangeContainers {
     if (!(Test-ExchangeContainersReady @(& $Inspect))) { throw 'Docker 容器未全部就绪，禁止启动 Java 应用。' }
 }
 
+# RAG在核心Java已就绪后单独准备；模型下载或镜像失败只能警告，不能终止交易服务。
+function Ensure-ExchangeRag {
+    [CmdletBinding()]
+    param([string]$Docker, [string]$ProjectRoot, [hashtable]$Settings, [string]$RunDirectory, [scriptblock]$Inspect, [scriptblock]$BuildRag)
+    if ((Get-ExchangeSetting $Settings 'SEC_RAG_ENABLED' 'true') -eq 'false') { Write-Host 'RAG已关闭，使用原文知识查询。'; return }
+    try {
+        $ragRoot = Join-Path $ProjectRoot 'build/rag/embedding'
+        $inputs = @(Get-ChildItem -LiteralPath $ragRoot -File | Where-Object { $_.Extension -eq '.py' -or $_.Name -in @('Dockerfile', 'requirements.txt', '.dockerignore') })
+        $hash = Get-ExchangeFilesFingerprint $ProjectRoot $inputs
+        $state = Join-Path $ProjectRoot 'build/.local-run/rag-build-state.json'
+        $previous = ''
+        if (Test-Path -LiteralPath $state) { $previous = (Get-Content -LiteralPath $state -Raw -Encoding UTF8 | ConvertFrom-Json).InputHash }
+        if (!$Inspect) { $Inspect = { Get-ExchangeContainerStates $Docker } }
+        $states = @(& $Inspect)
+        $ready = @($states | Where-Object { $_.Name -in @('chroma', 'embedding') -and $_.State -eq 'running' -and $_.Health -eq 'healthy' }).Count -eq 2
+        if ($ready -and $previous -eq $hash) { Write-Host 'Chroma与嵌入服务已健康，源码未变，跳过RAG构建。'; return }
+        Write-Host '交易系统已可用，正在准备可降级RAG服务；首次镜像/模型下载可能较慢。'
+        # 可注入无副作用构建动作做隔离测试；默认仅准备两个知识服务。
+        if (!$BuildRag) { $BuildRag = {
+            & $Docker compose --env-file (Join-Path $ProjectRoot 'build/.env.securities') -f (Join-Path $ProjectRoot 'build/docker-compose.yml') up -d --build --no-deps chroma embedding *> (Join-Path $RunDirectory 'rag-services.log')
+            if ($LASTEXITCODE -ne 0) { throw 'RAG容器准备失败' }
+        } }
+        & $BuildRag
+        [pscustomobject]@{ InputHash = $hash } | ConvertTo-Json | Set-Content -LiteralPath $state -Encoding UTF8
+        Write-Host 'RAG容器已启动；模型与索引在后台就绪，准备期间知识问答退回原文。'
+    } catch { Write-Warning ('RAG暂不可用，交易继续运行；请查看本轮rag-services.log。') }
+}
+
 # 只读取本 Compose 项目的名称和状态，不展开包含密码的容器配置。
 function Get-ExchangeContainerStates {
     param([string]$Docker)
@@ -266,7 +294,7 @@ function Start-ExchangeProject {
     if ($ports.Count -ne 14) { throw '应用业务端口与管理端口不能重复。' }
     $docker = (Get-Command docker -ErrorAction Stop).Source
     Ensure-ExchangeContainers -Inspect { Get-ExchangeContainerStates $docker } -StartContainers {
-        & $docker compose --env-file (Join-Path $ProjectRoot 'build/.env.securities') -f (Join-Path $ProjectRoot 'build/docker-compose.yml') up -d --wait --wait-timeout 180 --no-recreate
+        & $docker compose --env-file (Join-Path $ProjectRoot 'build/.env.securities') -f (Join-Path $ProjectRoot 'build/docker-compose.yml') up -d --wait --wait-timeout 180 --no-recreate mysql redis kafka grafana prometheus nginx
         if ($LASTEXITCODE -ne 0) { throw 'Docker Compose 启动失败；请检查 Docker 和镜像下载，不会继续启动 Java。' }
     }
     $dependencies = @(
@@ -345,6 +373,7 @@ function Start-ExchangeProject {
         $gateway = [pscustomobject]@{ Name = 'Nginx 到 UI 的会话链路'; Kind = 'gateway'; ReadyUrl = $uiUrl + '/session' }
         Wait-ExchangeApplicationReady $gateway $TimeoutSeconds -Alive { return $true } -Probe { param($url) Invoke-RestMethod -Uri $url -TimeoutSec 3 }
         Write-Host ('所有应用已就绪：' + $uiUrl)
+        Ensure-ExchangeRag $docker $ProjectRoot $settings $runDirectory
         if (!$NoBrowser) {
             try { Start-Process $uiUrl -ErrorAction Stop }
             catch { Write-Warning ('应用已启动，但浏览器未能打开，请手动访问 ' + $uiUrl) }

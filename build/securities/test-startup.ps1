@@ -137,4 +137,35 @@ $realInputs = @(Get-ExchangeBuildInputs $projectRoot)
 Assert-Startup (@($realInputs | Where-Object { $_.FullName -match 'build[\\/]sql[\\/]securities[\\/]V' }).Count -gt 0) '必须纳入打包 SQL'
 Assert-Startup (@($realInputs | Where-Object { $_.Name -eq '.env.securities' -or $_.FullName -match 'config-repo[\\/]' }).Count -eq 0) '私密配置和外置配置不应触发 Java 重编译'
 Write-Host 'PASS 13：实际内容哈希和输入边界'
-Write-Host '一键启动脚本隔离测试全部通过（13 组）。'
+# 新知识服务的失败不能阻断交易，禁用时不读取目录或执行Docker。
+Ensure-ExchangeRag -Docker 'unused' -ProjectRoot 'Z:/does-not-exist' -Settings @{SEC_RAG_ENABLED='false'} -RunDirectory 'unused' -Inspect { throw '禁用时不应探测' } -BuildRag { throw '禁用时不应构建' }
+Write-Host 'PASS 14：RAG禁用不准备模型'
+
+# 临时源码与状态只写入随机测试目录，不修改正式构建状态或启动容器。
+$ragFixture=Join-Path ([IO.Path]::GetTempPath()) ('exchange-rag-startup-'+[Guid]::NewGuid().ToString('N'))
+$ragSource=Join-Path $ragFixture 'build/rag/embedding'
+$ragState=Join-Path $ragFixture 'build/.local-run'
+[void][IO.Directory]::CreateDirectory($ragSource)
+[void][IO.Directory]::CreateDirectory($ragState)
+try {
+    [IO.File]::WriteAllText((Join-Path $ragSource 'app.py'),'test-only')
+    $ragCounts=[pscustomobject]@{Builds=0}
+    $ragHealthy=@('chroma','embedding')|ForEach-Object{[pscustomobject]@{Name=$_;State='running';Health='healthy'}}
+    Ensure-ExchangeRag -Docker 'unused' -ProjectRoot $ragFixture -Settings @{} -RunDirectory $ragState -Inspect {return $ragHealthy} -BuildRag {$ragCounts.Builds++}
+    Ensure-ExchangeRag -Docker 'unused' -ProjectRoot $ragFixture -Settings @{} -RunDirectory $ragState -Inspect {return $ragHealthy} -BuildRag {$ragCounts.Builds++}
+    Assert-Startup ($ragCounts.Builds -eq 1) 'RAG相同源码和健康容器应复用构建'
+    Write-Host 'PASS 15：RAG构建与内容缓存'
+    $warnings=@()
+    Ensure-ExchangeRag -Docker 'unused' -ProjectRoot $ragFixture -Settings @{} -RunDirectory $ragState -Inspect {return @()} -BuildRag {throw '模拟下载失败'} -WarningVariable warnings
+    Assert-Startup ($warnings.Count -eq 1) 'RAG失败必须只警告，不抛出阻断交易的异常'
+    Write-Host 'PASS 16：RAG失败仅降级'
+} finally {
+    [IO.File]::Delete((Join-Path $ragSource 'app.py'))
+    [IO.File]::Delete((Join-Path $ragState 'rag-build-state.json'))
+    [IO.Directory]::Delete($ragSource)
+    [IO.Directory]::Delete((Join-Path $ragFixture 'build/rag'))
+    [IO.Directory]::Delete($ragState)
+    [IO.Directory]::Delete((Join-Path $ragFixture 'build'))
+    [IO.Directory]::Delete($ragFixture)
+}
+Write-Host '一键启动脚本隔离测试全部通过（16 组）。'

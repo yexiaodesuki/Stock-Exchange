@@ -15,7 +15,7 @@ Java 17 / Spring Boot 模拟证券交易所雏形，持续优化中。支持五�
 docker compose --env-file .env.securities up -d --wait
 ```
 
-六个容器名称固定：`mysql`、`redis`、`kafka`、`grafana`、`prometheus`、`nginx`。没有 Java 应用容器或迁移任务容器。Nginx 为统一入口，HTTP 经 UI 代理、WebSocket 转 Push，内部及管理路径不公开，详见 [网关说明](docs/nginx.md)。
+容器名称固定：核心六个为 `mysql`、`redis`、`kafka`、`grafana`、`prometheus`、`nginx`；知识 RAG 另用 `chroma`、`embedding`，仅本机开放 18080 / 18081。没有 Java 应用容器或迁移任务容器。首次构建嵌入镜像及下载模型需要网络；可复用本地模型缓存，详见 [助手说明](docs/assistant.md)。Nginx 为统一入口，HTTP 经 UI 代理、WebSocket 转 Push，内部及管理路径不公开，详见 [网关说明](docs/nginx.md)。
 
 Docker Desktop 就绪并填写本地配置后，在项目根目录执行一键启动（容器可尚未开启）：
 
@@ -23,7 +23,7 @@ Docker Desktop 就绪并填写本地配置后，在项目根目录执行一键�
 .\start.ps1
 ```
 
-脚本先检查六个容器，均健康就跳过，否则用现有 Compose 补齐并等待，不重建已有容器或删除数据卷。然后按需打包，先验证 Config 的六份客户端配置，再逐个等待应用及网关会话链路就绪，成功后打开网关页面。支持 PowerShell 5.1 / 7；若执行策略阻止，可用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1`，无需更改系统策略。
+脚本先检查核心六个容器，均健康就跳过，否则用现有 Compose 补齐并等待，不重建已有容器或删除数据卷。然后按需打包，先验证 Config 的六份客户端配置，再逐个等待应用及网关会话链路就绪。交易就绪后单独准备 RAG 容器，失败仅警告并退回原文知识查询；最后打开网关页面。支持 PowerShell 5.1 / 7；若执行策略阻止，可用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1`，无需更改系统策略。
 
 已有 JAR 且源码、资源、POM、打包 SQL 未变化时自动跳过 Maven；首次接管已有产物先核对时间，之后记录输入和 JAR 双指纹。`-Rebuild` 强制干净重建；`-SkipBuild` 显式使用现有 JAR，不保证与源码一致；`-NoBrowser` 不打开浏览器。日志、构建指纹和进程记录在被 Git 忽略的 `build/.local-run/`。重复执行复用本项目 JAR 进程；若需要重建但 Java 仍运行则拒绝覆盖，请先停止旧应用。未知端口占用（包括无法确认归属的 IDEA 实例）会明确报错，不自动停止。
 

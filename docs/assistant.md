@@ -1,7 +1,7 @@
-<!-- 第一阶段只读助手：解释事实、模型仅分类，未配置不调用外部服务。 -->
+<!-- 只读助手：本人事实、模拟行情摘要与白名单RAG；外部生成只接收公开证据，未配置不调用。 -->
 # 只读交易助手
 
-登录后展开“只读交易助手”，直接问“我还有多少钱可以用”“我的所有订单”“星河的订单”“青山能源的持仓”“我的入金情况”。界面不再要求证券、订单或入金编号。服务器识别目录全名、英文代码（不区分大小写）和中文前两字短名：星河、青山、安康、优选、远航。多证券、未知名称、日期或排除条件会要求澄清，不把不认识的股票静默当成全部股票。
+登录后展开“只读交易助手”，直接问“我还有多少钱可以用”“我的所有订单”“星河的订单”“青山能源的持仓”“我的入金情况”，也可以问“星河最近24小时行情”“五只股票最近7天行情”“如何充值”“限价单为什么冻结资金”。界面不要求证券、订单或入金编号。服务器识别目录全名、英文代码（不区分大小写）和中文前两字短名：星河、青山、安康、优选、远航。本人记录不支持日期筛选；行情支持下述滚动窗口。未知名称、未支持的组合、日期或排除条件会要求澄清，不把不认识的股票静默当成全部股票。
 
 所有订单视图包含当前活动委托和本人已结束委托总数，后者最多显示最近20条，并明确标识 MySQL 独立查询时点；不是无限历史逐条加载。没有指定证券时显示全部证券，不默认使用页面当前证券。旧接口编号字段仅用于兼容或程序绑定的记录上下文，不作为普通用户的操作要求。
 
@@ -17,9 +17,92 @@ SEC_ASSISTANT_API_KEY=
 SEC_ASSISTANT_DISABLE_THINKING=auto
 ```
 
-完整端点是供应商兼容 chat/completions 的 HTTPS URL，不自动拼接路径；DeepSeek 为 `https://api.deepseek.com/chat/completions`。`DISABLE_THINKING=auto` 仅对 DeepSeek 官方域名加入 `thinking.type=disabled`，也可显式 true/false。分类预算64 token，检查 finish_reason=length、空 content 和合法意图，不能读取或展示推理过程代替最终答案。密钥仍只放本机，不上传。用户显式开启后模型仅接收问题文本，不接收账户数据。所有金额、中文状态和结论由业务代码生成；页面显示事实卡片和表格，不再直接输出 JSON。
+完整端点是供应商兼容 chat/completions 的 HTTPS URL，不自动拼接路径；DeepSeek 为 `https://api.deepseek.com/chat/completions`。`DISABLE_THINKING=auto` 仅对 DeepSeek 官方域名加入 `thinking.type=disabled`，也可显式 true/false。分类预算64 token，检查 finish_reason=length、空 content 和合法意图，不能读取或展示推理过程代替最终答案。密钥仍只放本机，不上传。分类调用只接收问题文本；知识生成另接收最多三段公开文档，不接收账户事实。本人金额、中文状态和行情统计仍由业务代码生成；页面显示事实卡片和表格，不直接输出 JSON。
 
 API `/api/v1/assistant/status` 和 POST `/explain` 通过现有 Session/CSRF/签名链路，身份不由浏览器或模型指定。助手只引用只读服务；引擎端新增同一快照的本人上下文，内部端点仍只在本机使用，不经 Nginx 开放。活动订单超过200时拒绝完整解释。指定历史订单使用既有所有者校验的成交查询，独立时点不冒充同一快照。
+
+## 行情摘要与知识问答
+
+行情默认最近24小时，另外支持最近1小时、最近7天，时间窗口按服务器 UTC 毫秒计算，左闭右开；不支持“今天”、交易日、任意日期或组合范围。明确说一只证券，或“五只股票/全部证券”才能汇总；不默认使用页面当前证券。数据仅来自 MySQL `ticks` 的本系统模拟成交，不读取账户或交易对手身份。只读可重复读事务同时读取行情/输出投影进度和成交，查询时投影落后明确503，不返回伪零成交。
+
+每只证券完整计算窗口内成交笔数、股数、金额、最高最低价和按事件顺序的首末价；百分比是区间首末价变化，四舍五入至两位，绝非以前收盘价计算的日涨跌幅。金额用 BigDecimal 精确计算，输出十进制字符串。无成交明确说明；范围外最后一笔仅作额外参考，不加入窗口统计。只有一笔不计算趋势，缺失K线不补造。默认每证券最多10000笔，SQL多读一条检查超限，超过则422要求缩短范围，不以样本冒充完整统计。单语句一秒、只读事务五秒预算，原UI代理九秒超时保持不变；没有进行高并发容量保证。
+
+非敏感参数由 `config-repo/securities-api.yml` 的 `securities.assistant` 集中管理：`market.default-hours=24`、`market.max-days=7`、`market.max-trades-per-security=10000`、`knowledge.max-sections=3`，以及下述 RAG 参数。变更后按原流程重启 Java 应用；不建新交易表。
+
+知识只加载 `trading-api/src/main/resources/assistant/knowledge/` 下固定三文件：`trading-rules.md`、`user-guide.md`、`deposits.md`。章节格式为 `## 标题 | 同义词,同义词`，正文是经代码核对的用户说明；固定文件清单、32KiB文件上限、启动校验和最多三段结果，不扫描仓库、日志、私密配置或任意URL。当前混合检索见下文，返回文档、章节、正文哈希版本和摘录供页面展开核对；入金额度用当前生效 DepositPolicy 填充，文档不硬编码另一份额度。修改文档需同步审查检索别名，哈希版本由正文自动计算。
+
+现在知识分支使用下述受控 RAG；分类模型仍只接收问题，不能自由执行工具或 SQL。`如何充值`走知识分支，`我的入金记录`走本人数据分支；明确本地意图优先于模型。未收录知识返回 `KNOWLEDGE_NOT_FOUND`、空出处和不知道的说明；知识不包含真实交易所交易日、真实股票资讯、价格预测或投资建议。当前不保证任意同义表达、多轮指代和复杂组合问题。知识与行情沿用原助手限流和故障降级，不进入交易事件链。
+
+## 无重排序 RAG
+
+链路为：固定三份 Markdown → BGE tokenizer 分片 → 本机 CPU 文档向量 → Chroma；提问 → 本机查询向量与章节关键词召回 → RRF 融合 → 最多三段证据 → 可选聊天生成 → 引用校验 → 页面原文出处。没有重排序模型，也不会读取本机 reranker 缓存。
+
+### 模型与配置
+
+```dotenv
+SEC_RAG_ENABLED=true
+SEC_CHROMA_PORT=18080
+SEC_EMBEDDING_PORT=18081
+SEC_RAG_MODEL_DOWNLOAD=true
+# 可选：自己的 Hugging Face hub 缓存根目录，不是模型快照目录
+SEC_RAG_MODEL_SOURCE=D:/huggingface_cache/hub
+# 可独立关闭知识生成；不设置时沿用 SEC_ASSISTANT_EXTERNAL_ENABLED
+SEC_RAG_GENERATION_ENABLED=false
+```
+
+以上放在不上传的 `build/.env.securities`。嵌入固定 `BAAI/bge-small-zh-v1.5` 的 `7999e1d3359715c523056ef9478215996d62a620`，512维、归一化、CPU；仅查询添加中文检索指令，文档不添加。先验证只读缓存完整，再加载；没有缓存且允许下载时取固定版本到 Docker 模型卷。设置下载为 false 且缺模型时服务不可用，知识退回原文，不阻止交易。
+
+按 Markdown 章节切开，再按真实 tokenizer 控制每片含标题最多300 token、重叠40 token，优先句尾/换行。Java 校验每片属于原章节、偏移和原文完全一致且覆盖完整，拒绝静默截断。索引保留入金额度占位符，不持久化额度；召回后发送模型和展示前才用当前 DepositPolicy 展开。正文变更重新打包，策略变更重启 API；单纯改额度不重复嵌入。
+
+Chroma 使用 cosine，集合名由正文、模型指纹、预处理和实际切片共同哈希生成。后台每15秒检查，只有完整验证全部片段后才发布索引；同内容重启复用向量，半成品会补齐。新版本只查询新集合，旧集合保留但不参与当前检索；当前不自动清理旧集合，避免误删。Chroma 是可重建知识派生库，不是账户或资产数据库。
+
+向量最多召回8片，cosine distance 不超过0.46；与章节关键词前4项做 `1/(60+rank)` RRF 融合，按章节去重，最多3片/900 token。0.46是当前小语料校准值，不是“46%可信度”。24个相关问题、6个无关问题的本机样本结果为22/24相关证据在前三、6/6无关未召回；“能不能买半股”“股票价格最小单位”仍未命中，不能视为泛化或真实用户质量保证。
+
+### 生成和降级
+
+- `RAG_GENERATED`：已调用知识生成并通过格式/引用/阿拉伯数字校验；问题和公开证据发送到现有 HTTPS 聊天端点。
+- `RAG_EXTRACTIVE`：没有启用生成，直接展示检索原文，不冒充生成答案。
+- `RAG_EXTRACTIVE_FALLBACK`：生成超时、截断、协议或引用不合法，展示已检索原文。
+- `LEXICAL_FALLBACK`：Chroma、嵌入或索引不可用/关闭，退回随 JAR 打包的关键词原文查询。
+- 无证据时明确不知道，不调用生成器。
+
+查询嵌入1.5秒、Chroma查询1秒、知识生成6.5秒预算；生成最多768 token、32KiB响应，不重试。UI仅助手解释请求延长到15秒，其他代理仍9秒。原分类调用仍保留2秒预算；不要把其预算当作整个 RAG 端到端 SLA。页面使用 textContent 展示答案和 `[K1]` 出处，不执行模型 HTML。引用存在、数字能在证据中找到，仍不能证明每句语义正确或彻底消除幻觉；中文数字和错误归因需要真实模型质量评测。
+
+账户、订单、入金与行情统计不传给知识生成器，不写交易库、Redis或Kafka。模型只能收到用户主动输入的问题，因此仍应避免用户在问题里填写隐私信息。索引状态经已认证助手 status 接口返回，不对公网开放 Chroma 或嵌入接口。
+
+### RAG 文件索引与验证
+
+详细代码位置和逐文件职责见 [RAG 实现说明](rag-implementation.md)。运行 `pwsh -NoProfile -File build/securities/test-phase4.ps1 -Gateway`；本地两个 RAG 服务就绪时，自动增加真实嵌入/Chroma测试，只创建随机知识集合，生成使用假模型，不收费；离线时明确跳过真实向量集成，单元及交易回归仍运行。测试集合结束后按登记名称和元数据验证再删除，不操作正式集合。
+
+### 原第二阶段实现位置（RAG后知识职责拆分见上文）
+
+| 文件（除注明外位于 trading-api/src/main/java/com/itranswarp/exchange） | 具体职责 |
+| --- | --- |
+| repository/AssistantMarketRepository.java（新增） | `read` 用只读可重复读事务检查进度并读取窗口成交；多读一条拒绝超量；`query` 仅映射公开字段。 |
+| service/assistant/AssistantMarketService.java（新增） | `read` 限定证券目录；`summarize` 精确计算金额和区间价格变化，区分无成交、单笔和多笔。 |
+| service/assistant/AssistantTimeRangeResolver.java（新增） | `resolve` 用可注入时钟确定窗口；不将十七天误认成七天，也不把未知日期默认为24小时。 |
+| service/assistant/AssistantKnowledgeService.java（新增） | `load` 只读固定资源；`read` 检索章节并给出处；`expand` 注入当前公开入金策略。 |
+| trading-api/src/main/resources/assistant/knowledge/{trading-rules,user-guide,deposits}.md（三份新增） | 经撮合、清算、页面及入金代码核对的用户规则、操作和入金说明；不包含凭据。 |
+| service/assistant/AssistantRules.java | 新增 MARKET/KNOWLEDGE 白名单及明确意图，区分如何操作和本人记录。 |
+| service/assistant/HttpAiModelClient.java | 分类提示加入两个新意图，仍只发用户问题，不发事实、文档或密钥到提示中。 |
+| service/assistant/AssistantSecurityResolver.java | `resolveMarket` 要求单证券或明确五证券，歧义不默认为第一只股票。 |
+| service/assistant/AssistantService.java | 按意图调用独立服务；行情独立解析窗口；本人记录日期限制保留；响应增加可选 sources。 |
+| service/assistant/AssistantPresentation.java | `market` 输出事实摘要；知识分支展示证据正文；不对公开问题附带私人余额。 |
+| web/api/AssistantController.java | `rejected` 固定映射422、503、429等中文提示，不泄露异常正文。 |
+| config/ApiConfiguration.java、config-repo/securities-api.yml | 装配只读依赖、当前策略和时钟；集中配置有界查询参数。 |
+| ui/src/main/resources/static/securities/{index.html,assistant.mjs,style.css} | 新快捷问题和能力说明；`renderReferences` 用 textContent 展示可展开出处，补充局部样式。 |
+| trading-api/src/test/java/.../assistant/{AssistantPhaseTwoTest,AssistantMarketRepositoryTest}.java（新增） | 纯逻辑及随机库统计、故障、边界和不读取私人数据的回归。 |
+| ui/src/test/java/.../demo/SecuritiesUiProcessTest.java、ui/src/test/js/browser.mjs | 真实签名/Session/CSRF、逐证券SQL对照、浏览器摘要和出处，以及原交易/入金/恢复回归。 |
+
+行情及本人数据同步只读返回，不写用户、资产、成交、Redis缓存或Kafka事件；知识文件和配置修改需要按既有打包启动流程生效。RAG只在独立Chroma保存派生索引；没有自动生成交易、导入历史或重建交易数据库。
+
+### 第二阶段验收（2026-11-02）
+
+最终执行 `pwsh -NoProfile -File build/securities/test-phase4.ps1 -Gateway`：Java 126项，125通过、1项条件跳过，零失败、零错误；前端纯逻辑6项通过。随机库验证同毫秒反向插入时按事件成交顺序统计、左闭右开边界、跨证券隔离、完整金额、范围外旧成交、投影落后503和超量422。纯逻辑覆盖无成交/单笔、不虚构趋势、未知知识、动态额度、口语分流、混合问题澄清和脱敏错误提示。
+
+真实隔离UI/API以Session/CSRF查询五证券摘要，并与SQL逐证券对照笔数和金额；知识查询不返回私人申请。浏览器实际提问“星河最近行情怎么样”、五证券摘要、“如何充值”、冻结规则和未收录IPO问题，检查事实和可展开出处；随后原交易、撤单、网络重连及入金丢响应幂等流程通过。查询前后事件和资金流水数量不变。自动测试强制关闭外部模型，不产生收费请求；本轮未验证真实供应商的新意图识别质量，也未做高并发压测。不是生成式RAG或真实股市分析。
+
+随后已用 `start.ps1 -NoBrowser` 启动最终版本，七个Java应用均就绪，现有六个容器健康。正式网关会话、新版页面及助手资源返回200；未向正式账户发起入金或交易，也未调用真实模型。正式身份、事件、订单、流水、快照及入金相关表的部署前后数据指纹一致。
 
 全局最多2请求，每用户1请求，超额429。模型超时2秒，完整 Future 等待上限2.3秒，响应体最多16KiB，不跟随重定向；数据读取沿用原内部3秒超时。无自动重试、无聊天持久化、无写事件、无新表/容器。该限制不是零性能影响或生产隔离保证；内部快照当前复用完整快照读取，大规模账户需后续测量和优化。
 

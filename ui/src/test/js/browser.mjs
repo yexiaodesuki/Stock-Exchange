@@ -1,4 +1,4 @@
-/* 真实 Chromium 验收：隔离身份、交易行情及入金助手展示，验证丢响应刷新和存储不可用的安全行为。 */
+/* 真实 Chromium 验收：隔离身份、交易行情及本人/行情/知识助手展示，验证入金丢响应和存储不可用。 */
 import {chromium} from 'playwright';
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -19,13 +19,24 @@ async function select(page,symbol,name){await page.getByRole('button',{name:symb
 async function place(page,direction,price,quantity){await page.locator('#direction').selectOption(direction);await page.locator('#price').fill(price);await page.locator('#quantity').fill(quantity);await page.getByRole('button',{name:'提交委托',exact:true}).click();await until(async()=>(await page.locator('#pending').innerText()).includes('暂无记录'),'引擎确认');}
 /** 等待微小网络延时用 Promise，断言仍以可观察 DOM 为依据。 */
 function pause(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
+/** 真实填写问题并等待按钮释放，不能把上一个问题的旧结果当成新回答。 */
+async function ask(page,question){await page.locator('#assistant-question').fill(question);await page.locator('#assistant-submit').click();await until(async()=>!(await page.locator('#assistant-submit').isDisabled()),'助手完成 '+question);}
 try{
   const a=await login(buyer,'user1@example.com',process.env.SECURITIES_BROWSER_BUYER_PASSWORD),b=await login(seller,'user2@example.com',process.env.SECURITIES_BROWSER_SELLER_PASSWORD);
   assert.equal(await a.locator('#username').innerText(),'用户一');assert.equal(await b.locator('#username').innerText(),'用户二');
   // 无模型配置仍可解释本人冻结，随后继续原交易流程验证助手不阻断交易。
   await a.locator('#assistant-panel summary').click();assert.equal(await a.locator('#assistant-security,#assistant-order,#assistant-deposit').count(),0);await a.locator('#assistant-question').fill('为什么资金冻结');await a.locator('#assistant-submit').click();await until(async()=>(await a.locator('#assistant-message').innerText()).includes('规则说明'),'助手规则降级');assert.match(await a.locator('#assistant-facts').innerText(),/与账户冻结金额一致/);
   await a.locator('#assistant-question').fill('星河的订单');await a.locator('#assistant-submit').click();await until(async()=>(await a.locator('#assistant-facts').innerText()).includes('星河科技当前有'),'简称查询订单');assert.doesNotMatch(await a.locator('#assistant-facts').innerText(),/青山能源|安康医药/);
-  await a.locator('#assistant-question').fill('我还有多少钱可以用？');await a.locator('#assistant-submit').click();await until(async()=>(await a.locator('#assistant-facts').innerText()).includes('共享 USD 资金'),'口语资金查询');await a.locator('#assistant-panel summary').click();
+  await a.locator('#assistant-question').fill('我还有多少钱可以用？');await a.locator('#assistant-submit').click();await until(async()=>(await a.locator('#assistant-facts').innerText()).includes('共享 USD 资金'),'口语资金查询');
+  await ask(a,'星河最近行情怎么样');assert.match(await a.locator('#assistant-facts').innerText(),/星河科技共 3 笔成交/);assert.match(await a.locator('#assistant-facts').innerText(),/最近24小时（默认）/);assert.doesNotMatch(await a.locator('#assistant-facts').innerText(),/共享 USD 资金/);
+  await ask(a,'五只股票最近24小时行情');for(const name of ['星河科技','青山能源','安康医药','优选消费','远航工业'])assert.ok((await a.locator('#assistant-facts').innerText()).includes(name));
+  await a.getByRole('button',{name:'操作指南',exact:true}).click();await until(async()=>(await a.locator('.assistant-source').count())>0,'知识文档出处');assert.match(await a.locator('#assistant-facts').innerText(),/模拟入金/);await a.locator('.assistant-source summary').first().click();assert.match(await a.locator('.assistant-source').first().innerText(),/UTC/);
+  await ask(a,'限价单为什么冻结资金');assert.match(await a.locator('#assistant-facts').innerText(),/限价 × 委托股数/);assert.ok(await a.locator('.assistant-source').count()>0);
+  await ask(a,'如何办理IPO');assert.match(await a.locator('#assistant-facts').innerText(),/没有收录足够依据/);assert.equal(await a.locator('.assistant-source').count(),0);
+  // 只模拟生成响应验证UI契约及XSS文本边界；真实召回由独立本地RAG集成测试覆盖。
+  await a.route('**/api/v1/assistant/explain',async route=>{await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({mode:'RAG_GENERATED',fallbackReason:'',intent:'KNOWLEDGE',explanation:'仅依据公开项目文档。',highlights:['查看模拟入金入口[K1]。<img src=x onerror=alert(1)>'],sources:[{id:'K1',title:'模拟入金',section:'入口',version:'test-contract',excerpt:'公开操作说明。'}],tables:[],facts:{source:'公开知识'},asOf:Date.now()})});});
+  await ask(a,'如何充值');assert.match(await a.locator('#assistant-message').innerText(),/基于项目文档生成/);assert.match(await a.locator('.assistant-source summary').innerText(),/\[K1\]/);assert.equal(await a.locator('#assistant-facts img').count(),0);await a.unroute('**/api/v1/assistant/explain');
+  await ask(a,'我还有多少钱可以用？');assert.equal(await a.locator('.assistant-source').count(),0);await a.locator('#assistant-panel summary').click();
   for(const [symbol,name] of [['STAR','星河科技'],['GREEN','青山能源'],['CARE','安康医药'],['DAILY','优选消费'],['SAIL','远航工业']]){await select(a,symbol,name);await until(async()=>(await a.locator('#ticks tr').count())===4,'每证券三条演示成交');assert.match(await a.locator('#chart-caption').innerText(),/最新 OHLC/);}
   // 触发多个交错请求，最后的 SAIL 页面不能被 STAR/GREEN 的慢响应覆盖。
   await a.route('**/securities/1001/ticks',async route=>{await pause(700);try{await route.continue();}catch(aborted){/* 快速切股会取消旧请求；已取消路由不能继续发送。 */}});

@@ -1,4 +1,4 @@
-/* 六进程隔离验收：交易、含日期的入金助手查询、强杀恢复和页面；独立 Nginx 验证网关。 */
+/* 六进程隔离验收：交易、本人数据/行情/知识助手、强杀恢复和页面；独立 Nginx 验证网关。 */
 package com.itranswarp.exchange.ui.demo;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -452,6 +452,9 @@ class SecuritiesUiProcessTest {
     env.put("SECURITIES_JDBC_URL", System.getenv("SECURITIES_PHASE2_DB_URL"));
     // 无论开发者是否已填模型密钥，隔离联调都禁止访问收费模型。
     env.put("SEC_ASSISTANT_EXTERNAL_ENABLED", "false");
+    // 交易回归与真实知识索引隔离；RAG另用随机文档集合和假生成器验收。
+    env.put("SEC_RAG_ENABLED", "false");
+    env.put("SEC_RAG_GENERATION_ENABLED", "false");
     env.put("SECURITIES_NAMESPACE", namespace);
     env.put("SECURITIES_AUTH_KEY", key);
     env.put("SEC_KAFKA_BOOTSTRAP_SERVERS", System.getenv("SECURITIES_TEST_BOOTSTRAP"));
@@ -498,6 +501,7 @@ class SecuritiesUiProcessTest {
     assertEquals(403,send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"账户余额\"}",null,null).statusCode());
     assertEquals(200,send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"账户冻结\"}",token,null).statusCode());
     verifyAssistantDeposits(newcomer,token,1);
+    verifyAssistantPhaseTwo(newcomer,token);
     var detail=send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"入金状态\",\"depositId\":\""+id+"\"}",token,null);
     assertEquals(200,detail.statusCode(),detail.body());
     assertEquals("1000.00",tree(detail).path("tables").path(0).path("rows").path(0).path(0).asText());
@@ -538,6 +542,23 @@ class SecuritiesUiProcessTest {
       amount(history.path(i).path("amount").asText(),rows.path(i).path(0));
       assertEquals("已到账",rows.path(i).path(1).asText());
     }
+  }
+
+  /** 用真实 Session/CSRF 读取行情和知识，逐证券与 SQL 对照，且不能增加事件或资金流水。 */
+  private void verifyAssistantPhaseTwo(HttpClient user,String token) throws Exception {
+    await(()->count("SELECT sequenceId FROM projection_offsets WHERE name='quotation'")==count("SELECT sequenceId FROM engine_output_checkpoint WHERE id=1"),"助手行情投影追平");
+    int before=count("SELECT COUNT(*) FROM events"),flows=count("SELECT COUNT(*) FROM transfer_logs");
+    var reply=send(user,"POST","/api/v1/assistant/explain","{\"question\":\"五只股票最近24小时行情\"}",token,null);assertEquals(200,reply.statusCode(),reply.body());var answer=tree(reply);assertEquals("MARKET",answer.path("intent").asText());var facts=answer.path("facts");assertEquals(5,facts.path("markets").size());assertFalse(facts.has("cash"));
+    for(var row:facts.path("markets")){
+      long id=jdbc.queryForObject("SELECT securityId FROM securities WHERE symbol=?",Long.class,row.path("symbol").asText());
+      int total=jdbc.queryForObject("SELECT COUNT(*) FROM ticks WHERE securityId=? AND createdAt>=? AND createdAt<?",Integer.class,id,facts.path("from").asLong(),facts.path("to").asLong());assertEquals(total,row.path("count").asInt());
+      if(total>0){String sum=jdbc.queryForObject("SELECT SUM(price*quantity) FROM ticks WHERE securityId=? AND createdAt>=? AND createdAt<?",java.math.BigDecimal.class,id,facts.path("from").asLong(),facts.path("to").asLong()).toPlainString();amount(sum,row.path("amount"));}
+    }
+    var single=tree(send(user,"POST","/api/v1/assistant/explain","{\"question\":\"星河最近行情怎么样\"}",token,null));assertEquals(1,single.path("facts").path("markets").size());assertEquals("STAR",single.path("facts").path("markets").path(0).path("symbol").asText());
+    var guide=send(user,"POST","/api/v1/assistant/explain","{\"question\":\"我该怎么充值\"}",token,null);assertEquals(200,guide.statusCode(),guide.body());var knowledge=tree(guide);assertEquals("KNOWLEDGE",knowledge.path("intent").asText());assertEquals("模拟入金",knowledge.path("sources").path(0).path("title").asText());assertFalse(knowledge.path("facts").has("records"));
+    assertEquals("TIME_FILTER_NOT_SUPPORTED",tree(send(user,"POST","/api/v1/assistant/explain","{\"question\":\"星河今天行情\"}",token,null)).path("fallbackReason").asText());
+    assertEquals("KNOWLEDGE_NOT_FOUND",tree(send(user,"POST","/api/v1/assistant/explain","{\"question\":\"如何办理IPO\"}",token,null)).path("fallbackReason").asText());
+    assertEquals(before,count("SELECT COUNT(*) FROM events"));assertEquals(flows,count("SELECT COUNT(*) FROM transfer_logs"));
   }
 
   /** 只停止本测试拥有的应用，不触碰用户已启动的 Java 服务。 */

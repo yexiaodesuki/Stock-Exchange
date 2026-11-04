@@ -1,4 +1,4 @@
-/* 证券名称解析：仅使用目录全名、代码和明确短名，多证券或未知目标要求澄清，不猜编号。 */
+/* 证券名称解析：使用目录全名、代码和短名；行情全部范围必须明确表达，未知目标不猜编号。 */
 package com.itranswarp.exchange.service.assistant;
 import com.itranswarp.exchange.securities.*;
 import java.util.*;
@@ -32,4 +32,17 @@ public final class AssistantSecurityResolver {
   }
   /** 友好名称取自目录，不让内部编号取代证券名称。 */
   public String name(long id){return catalog.require(id).name();}
+  /** 行情没有指定目标时不可默认第一只；未知名称或部分组合不能被当成五证券汇总。 */
+  public Selection resolveMarket(String question,Long explicit){
+    boolean all=question.matches("(?s).*(五只|五支|全部|所有|整体).*");
+    var selection=resolve(question,explicit);
+    if(!selection.clarification().isBlank())return selection;
+    if(question.matches("(?s).*(和|与|及|、).*")&&selection.securityId()!=null)return new Selection(null,"","请一次查询一只证券，或明确查询五只证券整体行情；组合问题暂不支持。");
+    if(selection.securityId()!=null)return all?new Selection(null,"","请问一只证券，或明确问五只证券的整体行情，不混合两个范围。"):selection;
+    if(all){
+      String rest=question.replaceAll("五只|五支|全部|所有|整体|股票|证券|行情|走势|成交量|成交金额|最高价|最低价|成交|摘要|情况|如何|怎么样|最近|过去|今天|昨天|本周|上周|本月|上月|近|小时|天|的|请|查看|看看|一下|目前|现在|[一二三四五六七八九十百0-9\\s\\p{Punct}，。？！]","");
+      if(rest.isBlank())return new Selection(null,"五证券","");
+    }
+    return new Selection(null,"","请说证券名称，例如“星河最近行情”，或问“五只股票最近24小时行情”；未知证券和多只组合暂不支持。");
+  }
 }

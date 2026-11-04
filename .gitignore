@@ -55,6 +55,13 @@ application-local.yaml
 *.jks
 
 # Local runtime data
+/build/.rag-model-source/
+chroma-data/
+embedding-models/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
 /build/.local-run/
 mysql-data/
 redis-data/

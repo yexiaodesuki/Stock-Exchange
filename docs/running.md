@@ -1,4 +1,4 @@
-<!-- 六容器本地网关环境说明：保留数据，Java 通过根目录脚本或 IDEA 启动。 -->
+<!-- 本地网关与可降级RAG环境说明：保留数据，Java通过根目录脚本或IDEA启动。 -->
 # 运行与验证
 
 ## 文件与首次配置
@@ -18,7 +18,7 @@ docker compose --env-file .env.securities up -d --wait
 docker compose --env-file .env.securities ps
 ```
 
-六个固定容器名不能在同一个 Docker 引擎中重复。因此本配置面向一个开发环境，不支持同机直接并行启动第二套同名栈。已有手工 nginx 须先确认用途，启动脚本不会删除或接管它。
+八个固定容器名不能在同一个 Docker 引擎中重复。因此本配置面向一个开发环境，不支持同机直接并行启动第二套同名栈。已有手工 nginx 须先确认用途，启动脚本不会删除或接管它。首次含嵌入镜像构建和模型下载，可能超过 Compose 的默认健康等待时间；可先 `docker compose --env-file .env.securities build embedding`，再 `docker compose --env-file .env.securities up -d --wait --wait-timeout 600`。核心交易不依赖模型就绪，根目录启动脚本会将两者分开准备。
 
 | 容器 | 宿主机端口 | 数据卷 |
 |---|---|---|
@@ -28,8 +28,12 @@ docker compose --env-file .env.securities ps
 | grafana | 3000 | stock-exchange-monitoring_grafana-data |
 | nginx | 8080 | 无业务数据卷，配置只读挂载 |
 | prometheus | 9090 | stock-exchange-monitoring_prometheus-data |
+| chroma | 18080 | stock-exchange-securities_chroma-data（公开文档向量，可重建） |
+| embedding | 18081 | stock-exchange-securities_embedding-models（模型缓存） |
 
 全部发布到 127.0.0.1。保留既有卷名是为了保留证券数据和监控数据，Compose 对跨项目复用旧监控卷的标签警告不表示数据损坏。新克隆机器没有这些卷时会自动创建，不需要手工 docker volume create。
+
+`build/rag/embedding` 是 CPU 嵌入服务镜像源码，不含模型权重。`SEC_RAG_MODEL_SOURCE` 可指向 Hugging Face hub 缓存根目录，以只读方式复用固定版本的 BGE 模型；未设置时使用空目录并按固定版本下载到命名卷。私密配置示例、离线开关、分片及 RAG 降级见 [助手说明](assistant.md#无重排序-rag)。`SEC_RAG_ENABLED=false` 可关闭 Java 语义检索及脚本中的 RAG 准备，但手动不带服务名的 Compose up 仍会启动配置里的全部服务。
 
 MySQL 只创建 exchange_securities 数据库和应用用户。证券目录加载入口 `SecurityCatalog.load` 先调用 `SchemaMigration.migrate`，使用 JAR 内打包的 V1/V2/V3 SQL；迁移完成才校验证券家族并创建业务服务。首次启动含快照表，不需要后来手动补表。Flyway 使用原历史表与数据库锁，并发启动可串行校验；版本校验失败拒绝启动，禁止用 repair、baseline 或清库绕过。
 
