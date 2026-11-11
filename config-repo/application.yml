@@ -1,124 +1,27 @@
-# 全局业务与监控配置：依赖仅做只读探测；每个应用单独设置管理端口。
-
-server:
-  tomcat:
-    # default tomcat settings:
-    use-forward-headers: ${TOMCAT_USE_FORWARD_HEADERS:true}
-    protocol-header: ${TOMCAT_PROTOCOL_HEADER:x-forwarded-proto}
-
-exchange:
-  monitoring:
-    dependencies-enabled: ${DEPENDENCY_MONITORING_ENABLED:true}
-    probe-interval-ms: ${DEPENDENCY_PROBE_INTERVAL_MS:15000}
-    dependencies: mysql,redis,kafka
-  config:
-    order-book-depth: ${ORDER_BOOK_DEPTH:50}
-    debug-mode: ${EXCHANGE_DEBUG_MODE:false}
-    time-zone: ${EXCHANGE_TIME_ZONE:}
-    hmac-key: ${EXCHANGE_HMAC_KEY:ChangeThisHmacKey4ExchangeConfig}
-    session-timeout: ${EXCHANGE_SESSION_TIMEOUT:P3D}
-    api-endpoints:
-      trading-api: ${TRADING_API:http://localhost:8001}
-      trading-engine-api: ${TRADING_ENGINE_API:http://localhost:8002}
-
-  # 风控(See RiskControlService):
-  risk-control:
-    #
-    # 时长配置，格式：标准ISO-8601 Period格式。示例：
-    #
-    # P1D = 1天
-    # P2DT10H = 2天10小时
-    # PT2H30M = 2小时30分
-    # PT60S = 60秒
-    #
-    # 通知消息失效时间(60秒):
-    notify-message-expires: ${NOTIFY_MESSAGE_EXPIRES:PT60S}
-    # 转出消息失效时间(7天):
-    transfer-out-message-expires: ${TRANSFER_OUT_MESSAGE_EXPIRES:P7D}
-  setting:
-    scheduler:
-      cron:
-        reload-trading-metadata: ${CRON_RELOAD_TRADING_METADATA:0 */10 * * * *}
-        # 每10秒钟刷新一次latest-price:
-        update-latest-price: ${CRON_UPDATE_LATEST_PRICE:0,10,20,30,40,50 * * * * *}
-      fixed-delay:
-        flush-orderbook: ${FIXED_DELAY_FLUSH_ORDERBOOK:500}
-        reinvoke-transfer: ${FIXED_DELAY_REINVOKE_TRANSFER:60000}
-        # deprecated:
-        reload-trading-metadata: ${FIXED_DELAY_RELOAD_TRADING_METADATA:600000}
-        save-sequence-id: ${FIXED_DELAY_SAVE_SEQUENCE_ID:60000}
-    # 交易所时区，默认为ZoneId.systemDefault():
-    timezone: ${EXCHANGE_TIMEZONE:}
-    # global 32-random-bytes as AES key:
-    # 全局32个随机ASCII字符作为AES key:
-    aes-key: ${EXCHANGE_AES_KEY:CryptoExchangeAESRandomSecureKey}
-    # 子系统的endpoint设置:
-    endpoint:
-      ui: ${UI_ENDPOINT:http://localhost:8000}
-      meta-api: ${META_API_ENDPOINT:http://localhost:8001}
-      wallet-api: ${WALLET_API_ENDPOINT:http://localhost:8901}
-      spots-api: ${SPOTS_API_ENDPOINT:http://localhost:8101}
-      spots-trading-internal-api: ${SPOTS_TRADING_INTERNAL_API_ENDPOINT:http://localhost:8103}
-
+# 全证券公共配置；只包含非敏感参数，私密占位符只保留在客户端。
 spring:
-  kafka:
-    bootstrap-servers: ${KAFKA_SERVERS:localhost:9092}
-    consumer:
-      # set consumer group id (blank for auto):
-      group-id: ${KAFKA_CONSUMER_GROUP_ID:}
-      auto-offset-reset: ${KAFKA_CONSUMER_AUTO_OFFSET_RESET:latest}
-      max-poll-records: ${KAFKA_CONSUMER_MAX_POLL_RECORDS:500}
-      max-partition-fetch-bytes: ${KAFKA_MAX_PARTITION_FETCH_BYTES:1000000}
-
-  # redis configuration:
-  redis:
-    host: ${REDIS_HOST:localhost}
-    port: ${REDIS_PORT:6379}
-    password: ${REDIS_PASSWORD:}
-    database: ${REDIS_DATABASE:0}
-
-  # datasource:
+  # 显式迁移入口负责版本校验，禁用默认 Flyway 自动配置。
+  flyway:
+    enabled: false
   datasource:
-    url: jdbc:mysql://${DB_HOST:localhost}/${DB_NAME:exchange}?useSSL=false&allowMultiQueries=true&useUnicode=true&characterEncoding=utf8
-    username: ${DB_USERNAME:root}
-    password: ${DB_PASSWORD:password}
-    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: ${SECURITIES_JDBC_URL:jdbc:mysql://127.0.0.1:13306/exchange_securities?useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=UTF-8&connectTimeout=5000&socketTimeout=10000}
+    username: securities
     hikari:
-      auto-commit: false
-      connection-timeout: ${DB_TIMEOUT:3000}
-      validation-timeout: ${DB_TIMEOUT:3000}
-      max-lifetime: 600000
-      maximum-pool-size: ${DB_POOL_MAX:500}
-      minimum-idle: ${DB_POOL_IDEL:1}
-
-logging:
-  level:
-    root: ${LOGGING_ROOT_LEVEL:INFO}
-    org.apache.kafka: ${LOGGING_KAFKA_LEVEL:WARN}
-    com.itranswarp.exchange: ${LOGGING_EXCHANGE_LEVEL:INFO}
-
-# 不把外部共享依赖加入进程存活或本地就绪；聚合 health 另行包含 dependencies。
+      maximum-pool-size: 8
+server:
+  address: ${SECURITIES_BIND_ADDRESS:127.0.0.1}
+  error:
+    include-message: never
 management:
   server:
-    address: ${MANAGEMENT_ADDRESS:0.0.0.0}
+    address: ${SECURITIES_BIND_ADDRESS:127.0.0.1}
   endpoints:
     web:
       exposure:
         include: health,prometheus
-  endpoint:
-    health:
-      show-details: never
-      probes:
-        enabled: true
-      group:
-        liveness:
-          include: livenessState
-        readiness:
-          include: readinessState,application
-  health:
-    db:
-      # 数据库由后台缓存探测，避免每次健康查询同步访问连接池。
-      enabled: false
-  metrics:
-    tags:
-      application: ${spring.application.name}
+securities:
+  config-contract: securities-v1
+  namespace: ${SECURITIES_NAMESPACE:securities.v1}
+  kafka-bootstrap: ${SEC_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:19092}
+  redis-uri: ${SEC_REDIS_URI:redis://127.0.0.1:16379/0}
+  engine-url: ${SECURITIES_ENGINE_URL:http://127.0.0.1:8102}

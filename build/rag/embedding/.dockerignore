@@ -1,0 +1,8 @@
+# 构建上下文只允许服务源码；模型、缓存和本地运行数据不得上传构建器。
+__pycache__
+*.pyc
+.pytest_cache
+*.safetensors
+*.bin
+models
+cache

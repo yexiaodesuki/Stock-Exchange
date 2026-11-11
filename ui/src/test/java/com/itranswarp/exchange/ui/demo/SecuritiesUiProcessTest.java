@@ -1,0 +1,756 @@
+/* 六进程隔离验收：交易、本人数据/行情/知识助手、强杀恢复和页面；独立 Nginx 验证网关。 */
+package com.itranswarp.exchange.ui.demo;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import com.fasterxml.jackson.databind.*;
+import com.itranswarp.exchange.securities.SecuritiesChannels;
+import com.itranswarp.exchange.ui.service.UserService;
+import io.lettuce.core.*;
+import java.net.*;
+import java.net.http.*;
+import java.nio.file.*;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import org.apache.kafka.clients.admin.*;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
+
+@EnabledIfEnvironmentVariable(named = "SECURITIES_PHASE2_DB_URL", matches = ".+")
+class SecuritiesUiProcessTest {
+  private final ObjectMapper json = new ObjectMapper();
+  private final Map<String, Process> processes = new HashMap<>();
+  private final Map<String, Integer> ports = new HashMap<>();
+  private final HttpClient probe =
+      HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).connectTimeout(Duration.ofSeconds(2)).build();
+  private String namespace, key, buyerPassword, sellerPassword, csrf;
+  private Path root, logs;
+  private JdbcTemplate jdbc;
+
+  /** 已有账户时拒绝演示；重复邮箱事务回滚，失败的双身份准备不能留下半成品。 */
+  @Test
+  void refusesUsedEnvironmentAndRollsBackPartialIdentities() throws Exception {
+    String url = System.getenv("SECURITIES_PHASE2_DB_URL");
+    if (!url.matches("jdbc:mysql://[^/]+/exchange_securities_test_[a-f0-9]{32}\\?.+"))
+      throw new IllegalStateException("禁止测试开发库");
+    var source =
+        new DriverManagerDataSource(url, "securities", System.getenv("SECURITIES_DB_PASSWORD"));
+    // 单独运行此测试也先执行正式迁移，不能依赖其他测试碰巧创建表。
+    com.itranswarp.exchange.securities.SecurityCatalog.load(source);
+    jdbc = new JdbcTemplate(source);
+    reset();
+    var users = new UserService(source);
+    var broken =
+        new DemoBootstrap(
+            source,
+            users,
+            "127.0.0.1:1",
+            "securities.test.validation",
+            "http://127.0.0.1:1",
+            true,
+            "valid-password-12345",
+            "short");
+    assertThrows(IllegalArgumentException.class, broken::prepare);
+    assertEquals(0, count("SELECT COUNT(*) FROM users"));
+    assertEquals(0, count("SELECT COUNT(*) FROM bootstrap_runs"));
+    var original = users.create("owner@example.com", "已有用户", "valid-password-12345");
+    assertEquals(original, users.authenticate("OWNER@example.com", "valid-password-12345"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> users.authenticate("owner@example.com", "wrong-password-12345"));
+    assertThrows(
+        UserService.EmailConflict.class,
+        () -> users.create("owner@example.com", "重名用户", "valid-password-67890"));
+    assertEquals(1, count("SELECT COUNT(*) FROM users"));
+    assertEquals(1, count("SELECT COUNT(*) FROM password_auths"));
+    var refused =
+        new DemoBootstrap(
+            source,
+            users,
+            "127.0.0.1:1",
+            "securities.test.validation",
+            "http://127.0.0.1:1",
+            true,
+            "valid-password-12345",
+            "valid-password-67890");
+    assertThrows(IllegalStateException.class, refused::prepare);
+    assertEquals(0, count("SELECT COUNT(*) FROM demo_steps"));
+    assertEquals(0, count("SELECT COUNT(*) FROM events"));
+    reset();
+    var competing =
+        new DemoBootstrap(
+            source,
+            users,
+            "127.0.0.1:1",
+            "securities.test.validation",
+            "http://127.0.0.1:1",
+            true,
+            "valid-password-12345",
+            "valid-password-67890");
+    competing.prepare();
+    try (var held =
+        new com.itranswarp.exchange.securities.persistence.ProcessLease(source, "demo")) {
+      competing.start();
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while (!competing.status().get("state").equals("FAILED") && System.nanoTime() < deadline)
+        Thread.sleep(20);
+      assertEquals("FAILED", competing.status().get("state"));
+      assertEquals(1, count("SELECT COUNT(*) FROM bootstrap_runs WHERE status='RUNNING'"));
+      assertEquals(0, count("SELECT COUNT(*) FROM events"));
+    } finally {
+      competing.close();
+    }
+  }
+
+  /** 六个真实打包程序共用临时库；测试不得在开发库写入任何模拟资金。 */
+  @Test
+  void verifiesDemoRecoveryLoginProxyAndBrowser() throws Exception {
+    String url = System.getenv("SECURITIES_PHASE2_DB_URL");
+    if (!url.matches("jdbc:mysql://[^/]+/exchange_securities_test_[a-f0-9]{32}\\?.+"))
+      throw new IllegalStateException("禁止测试开发库");
+    var source =
+        new DriverManagerDataSource(url, "securities", System.getenv("SECURITIES_DB_PASSWORD"));
+    // 单独选择网关浏览器用例时同样建立完整的隔离表结构。
+    com.itranswarp.exchange.securities.SecurityCatalog.load(source);
+    jdbc = new JdbcTemplate(source);
+    reset();
+    root = Path.of(System.getenv("SECURITIES_TEST_ROOT"));
+    logs = Files.createTempDirectory("securities-phase4-");
+    System.out.println("第四阶段六服务日志目录：" + logs);
+    namespace = "securities.test." + UUID.randomUUID().toString().replace("-", "");
+    key = UUID.randomUUID() + "-" + UUID.randomUUID();
+    buyerPassword = UUID.randomUUID().toString();
+    sellerPassword = UUID.randomUUID().toString();
+    for (String module :
+        List.of("trading-engine", "trading-sequencer", "quotation", "trading-api", "push", "ui"))
+      ports.put(module, port());
+    ports.put("gateway", port());
+    var channels = new SecuritiesChannels(namespace);
+    var topics =
+        List.of("sequence", "transfer", "trade", "tick").stream().map(channels::topic).toList();
+    try (var admin =
+            AdminClient.create(
+                Map.of(
+                    "bootstrap.servers",
+                    System.getenv("SECURITIES_TEST_BOOTSTRAP"),
+                    "request.timeout.ms",
+                    5000,
+                    "default.api.timeout.ms",
+                    10000));
+        var redis = RedisClient.create(System.getenv("SECURITIES_TEST_REDIS_URI"));
+        var connection = redis.connect()) {
+      admin
+          .createTopics(topics.stream().map(t -> new NewTopic(t, 1, (short) 1)).toList())
+          .all()
+          .get(15, TimeUnit.SECONDS);
+      try {
+        start("trading-engine", false);
+        await(() -> status("trading-engine", "/internal/securities/status") == 200, "引擎就绪");
+        for (String module : List.of("trading-sequencer", "quotation", "trading-api", "push"))
+          start(module, false);
+        await(
+            () ->
+                status("trading-api", "/api/v1/securities") == 200
+                    && status("push", "/actuator/health") == 200,
+            "API 与推送启动");
+        start("ui", true);
+        await(
+            () -> count("SELECT COUNT(*) FROM demo_steps WHERE status='COMPLETE'") >= 3, "至少三步已执行");
+        // 真正强杀只由本测试拥有的 UI，不用优雅退出冒充突然中断。
+        var killed = processes.remove("ui");
+        killed.destroyForcibly();
+        assertTrue(killed.waitFor(15, TimeUnit.SECONDS));
+        int completed = count("SELECT COUNT(*) FROM demo_steps WHERE status='COMPLETE'");
+        assertTrue(completed < 100, "必须在演示未结束时注入中断");
+        start("ui", true);
+        await(
+            () -> count("SELECT COUNT(*) FROM bootstrap_runs WHERE status='COMPLETE'") == 1,
+            "断点续跑完成");
+        assertEquals(100, count("SELECT COUNT(*) FROM events"));
+        assertEquals(100, count("SELECT COUNT(*) FROM engine_results"));
+        assertEquals(100, count("SELECT COUNT(*) FROM demo_steps WHERE status='COMPLETE'"));
+        await(() -> count("SELECT COUNT(*) FROM ticks") == 15, "五证券十五笔成交投影");
+        await(
+            () -> count("SELECT sequenceId FROM projection_offsets WHERE name='quotation'") == 100,
+            "行情投影追平全部演示事件");
+        assertEquals(10, count("SELECT COUNT(*) FROM users"));
+        assertEquals(10, count("SELECT COUNT(*) FROM orders WHERE status='PENDING'"));
+        assertEquals(
+            10,
+            count(
+                "SELECT COUNT(*) FROM password_auths WHERE passwd LIKE 'pbkdf2$600000$%' AND"
+                    + " LENGTH(random)=32"));
+        assertEquals(10, count("SELECT COUNT(DISTINCT random) FROM password_auths"));
+        var buyer = client();
+        var anonymous = client();
+        var staticModule = send(anonymous, "GET", "/securities/app.mjs", null, null, null);
+        assertEquals(200, staticModule.statusCode());
+        assertTrue(
+            staticModule.headers().firstValue("Content-Type").orElse("").contains("javascript"),
+            "浏览器模块 MIME 必须正确");
+        assertEquals(401, send(anonymous, "GET", "/api/v1/account", null, null, null).statusCode());
+        csrf = tree(send(buyer, "GET", "/session", null, null, null)).path("csrf").asText();
+        assertEquals(403, send(buyer, "POST", "/auth/signin", "{}", null, null).statusCode());
+        var login =
+            send(
+                buyer,
+                "POST",
+                "/auth/signin",
+                json.writeValueAsString(
+                    Map.of("email", "user1@example.com", "password", buyerPassword)),
+                csrf,
+                null);
+        assertEquals(200, login.statusCode(), login.body());
+        var identity = tree(send(buyer, "GET", "/session", null, null, null));
+        assertEquals("用户一", identity.path("user").path("name").asText());
+        String rotated = identity.path("csrf").asText();
+        assertNotEquals(csrf, rotated);
+        csrf = rotated;
+        var account = tree(send(buyer, "GET", "/api/v1/account?userId=1", null, null, null));
+        amount("92062.50", account.path("cash").path("available"));
+        amount("3100", account.path("cash").path("frozen"));
+        for (var position : account.path("positions")) amount("1015", position.path("available"));
+        for (long security = 1001; security <= 1005; security++) {
+          assertEquals(
+              3,
+              tree(send(
+                      buyer, "GET", "/api/v1/securities/" + security + "/ticks", null, null, null))
+                  .path("data")
+                  .size());
+          assertEquals(
+              1,
+              tree(send(buyer, "GET", "/api/v1/orders?securityId=" + security, null, null, null))
+                  .size());
+        }
+        assertEquals(
+            404,
+            send(buyer, "POST", "/api/v1/internal/transfer", "{}", csrf, "unsafe").statusCode());
+        assertEquals(
+            400,
+            send(
+                    buyer,
+                    "POST",
+                    "/api/v1/orders",
+                    "{\"securityId\":1001,\"direction\":\"BUY\",\"price\":\"1.001\",\"quantity\":\"1\"}",
+                    csrf,
+                    "invalid")
+                .statusCode());
+        String body =
+            "{\"securityId\":1001,\"direction\":\"BUY\",\"price\":\"1.00\",\"quantity\":\"1\"}";
+        var placed = send(buyer, "POST", "/api/v1/orders", body, csrf, "ui-own-request");
+        assertEquals(202, placed.statusCode());
+        String id = tree(placed).path("requestId").asText();
+        await(
+            () ->
+                send(buyer, "GET", "/api/v1/requests/" + id, null, null, null).statusCode() == 200,
+            "代理保留带冒号请求标识");
+        assertEquals(
+            409,
+            send(
+                    buyer,
+                    "POST",
+                    "/api/v1/orders",
+                    body.replace("1.00", "2.00"),
+                    csrf,
+                    "ui-own-request")
+                .statusCode());
+        assertEquals(
+            202, send(buyer, "POST", "/api/v1/orders", body, csrf, "ui-own-request").statusCode());
+        await(() -> count("SELECT COUNT(*) FROM events") == 101, "幂等订单只执行一次");
+        // 重启六服务恢复状态：COMPLETE 不会按初始模板再次配资或重做行情。
+        for (String module : new ArrayList<>(processes.keySet())) stop(module);
+        start("trading-engine", false);
+        await(() -> status("trading-engine", "/internal/securities/status") == 200, "重启引擎恢复");
+        for (String module : List.of("trading-sequencer", "quotation", "trading-api", "push"))
+          start(module, false);
+        start("ui", true);
+        await(
+            () ->
+                status("ui", "/session") == 200 && status("trading-api", "/api/v1/account") == 401,
+            "六服务重启");
+        var again = client();
+        String proof = tree(send(again, "GET", "/session", null, null, null)).path("csrf").asText();
+        assertEquals(
+            200,
+            send(
+                    again,
+                    "POST",
+                    "/auth/signin",
+                    json.writeValueAsString(
+                        Map.of("email", "user1@example.com", "password", buyerPassword)),
+                    proof,
+                    null)
+                .statusCode());
+        var restored = tree(send(again, "GET", "/api/v1/account", null, null, null));
+        amount("92061.50", restored.path("cash").path("available"));
+        amount("3101", restored.path("cash").path("frozen"));
+        assertEquals(101, count("SELECT COUNT(*) FROM events"));
+        assertEquals(15, count("SELECT COUNT(*) FROM ticks"));
+        // 新注册用户身份存在但资金为零，不复用旧注册自动赠送机制。
+        var newcomer = client();
+        String fresh =
+            tree(send(newcomer, "GET", "/session", null, null, null)).path("csrf").asText();
+        assertEquals(
+            200,
+            send(
+                    newcomer,
+                    "POST",
+                    "/auth/signup",
+                    json.writeValueAsString(
+                        Map.of(
+                            "email",
+                            "fresh@example.com",
+                            "name",
+                            "<script>alert(1)</script>",
+                            "password",
+                            UUID.randomUUID().toString())),
+                    fresh,
+                    null)
+                .statusCode());
+        amount(
+            "0",
+            tree(send(newcomer, "GET", "/api/v1/account", null, null, null))
+                .path("cash")
+                .path("available"));
+        assertEquals(101, count("SELECT COUNT(*) FROM events"));
+        var duplicate = client();
+        String duplicateCsrf =
+            tree(send(duplicate, "GET", "/session", null, null, null)).path("csrf").asText();
+        assertEquals(
+            409,
+            send(
+                    duplicate,
+                    "POST",
+                    "/auth/signup",
+                    json.writeValueAsString(
+                        Map.of(
+                            "email",
+                            "fresh@example.com",
+                            "name",
+                            "重复邮箱",
+                            "password",
+                            UUID.randomUUID().toString())),
+                    duplicateCsrf,
+                    null)
+                .statusCode());
+        assertEquals(11, count("SELECT COUNT(*) FROM users"));
+        verifyDeposits(newcomer,again);
+        if ("true".equals(System.getenv("SECURITIES_TEST_BROWSER"))) browser();
+        else System.out.println("未启用浏览器验收：设置 SECURITIES_TEST_BROWSER=true 后运行第四阶段脚本。");
+        String logoutCsrf =
+            tree(send(again, "GET", "/session", null, null, null)).path("csrf").asText();
+        assertEquals(
+            200, send(again, "POST", "/auth/signout", "{}", logoutCsrf, null).statusCode());
+        assertEquals(401, send(again, "GET", "/api/v1/account", null, null, null).statusCode());
+      } finally {
+        for (String module : new ArrayList<>(processes.keySet())) stop(module);
+        var groups =
+            admin.listConsumerGroups().all().get(15, TimeUnit.SECONDS).stream()
+                .map(ConsumerGroupListing::groupId)
+                .filter(g -> g.startsWith(namespace + "."))
+                .toList();
+        if (!groups.isEmpty()) {
+          await(
+              () ->
+                  admin
+                      .describeConsumerGroups(groups)
+                      .all()
+                      .get(5, TimeUnit.SECONDS)
+                      .values()
+                      .stream()
+                      .allMatch(g -> g.members().isEmpty()),
+              "测试消费组退出");
+          admin.deleteConsumerGroups(groups).all().get(15, TimeUnit.SECONDS);
+        }
+        admin.deleteTopics(topics).all().get(15, TimeUnit.SECONDS);
+        var cursor = connection.sync().scan(ScanArgs.Builder.matches(namespace + ":*").limit(100));
+        while (true) {
+          if (!cursor.getKeys().isEmpty())
+            connection.sync().del(cursor.getKeys().toArray(String[]::new));
+          if (cursor.isFinished()) break;
+          cursor =
+              connection.sync().scan(cursor, ScanArgs.Builder.matches(namespace + ":*").limit(100));
+        }
+      }
+    }
+  }
+
+  /** 仅在明确测试库清理白名单表；目录、迁移和开发库不动。 */
+  private void reset() {
+    for (String table :
+        List.of(
+            "deposit_outbox",
+            "deposit_requests",
+            "deposit_daily_limits",
+            "demo_steps",
+            "bootstrap_runs",
+            "password_auths",
+            "user_profiles",
+            "users",
+            "event_outbox",
+            "engine_results",
+            "api_requests",
+            "engine_snapshots",
+            "unique_events",
+            "events",
+            "orders",
+            "match_details",
+            "clearings",
+            "transfer_logs",
+            "ticks",
+            "sec_bars",
+            "min_bars",
+            "hour_bars",
+            "day_bars")) jdbc.update("DELETE FROM " + table);
+    jdbc.update("UPDATE engine_output_checkpoint SET sequenceId=0 WHERE id=1");
+    jdbc.update("UPDATE projection_offsets SET sequenceId=0 WHERE name='quotation'");
+  }
+
+  /** 私有浏览器上下文使用不同 Cookie 容器，不能用同一 Cookie 测试买卖身份。 */
+  private HttpClient client() {
+    return HttpClient.newBuilder()
+        .cookieHandler(new CookieManager(null, CookiePolicy.ACCEPT_ALL))
+        .connectTimeout(Duration.ofSeconds(2))
+        .build();
+  }
+
+  /** 真实 HTTP 验证 CSRF 与幂等头，响应保留上游原状态。 */
+  private HttpResponse<String> send(
+      HttpClient client, String method, String path, String body, String proof, String id)
+      throws Exception {
+    var builder =
+        HttpRequest.newBuilder(URI.create(base("ui") + path)).timeout(Duration.ofSeconds(12));
+    if (proof != null) builder.header("X-CSRF-Token", proof);
+    if (id != null) builder.header("Idempotency-Key", id);
+    if (method.equals("POST"))
+      builder
+          .header("Content-Type", "application/json")
+          .POST(HttpRequest.BodyPublishers.ofString(body));
+    else builder.GET();
+    return client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+  }
+
+  /** 各进程使用随机端口、同一个随机测试命名空间，日志不含测试口令。 */
+  private void start(String module, boolean demo) throws Exception {
+    var builder =
+        new ProcessBuilder(
+            Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+            "-Xms24m",
+            "-Xmx112m",
+            "-XX:MaxMetaspaceSize=160m",
+            "-XX:ActiveProcessorCount=2",
+            "-Dfile.encoding=UTF-8",
+            "-jar",
+            root.resolve(module + "/target/" + module + ".jar").toString(),
+            "--server.port=" + ports.get(module),
+            "--management.server.port=0",
+            "--logging.level.root=WARN");
+    var env = builder.environment();
+    env.put("SECURITIES_JDBC_URL", System.getenv("SECURITIES_PHASE2_DB_URL"));
+    // 无论开发者是否已填模型密钥，隔离联调都禁止访问收费模型。
+    env.put("SEC_ASSISTANT_EXTERNAL_ENABLED", "false");
+    // 交易回归与真实知识索引隔离；RAG另用随机文档集合和假生成器验收。
+    env.put("SEC_RAG_ENABLED", "false");
+    env.put("SEC_RAG_GENERATION_ENABLED", "false");
+    env.put("SECURITIES_NAMESPACE", namespace);
+    env.put("SECURITIES_AUTH_KEY", key);
+    env.put("SEC_KAFKA_BOOTSTRAP_SERVERS", System.getenv("SECURITIES_TEST_BOOTSTRAP"));
+    env.put("SEC_REDIS_URI", System.getenv("SECURITIES_TEST_REDIS_URI"));
+    env.put("SECURITIES_ENGINE_URL", base("trading-engine"));
+    env.put("SECURITIES_API_URL", base("trading-api"));
+    env.put(
+        "SECURITIES_WEBSOCKET_URL",
+        gatewayTest() ? "/ws" : "ws://127.0.0.1:" + ports.get("push") + "/ws");
+    env.put("SECURITIES_ALLOWED_ORIGINS", base("ui") + "," + base("gateway"));
+    env.put("SECURITIES_DEMO_ENABLED", Boolean.toString(demo));
+    env.put("SECURITIES_DEMO_BUYER_PASSWORD", buyerPassword);
+    env.put("SECURITIES_DEMO_SELLER_PASSWORD", sellerPassword);
+    for (int i = 1; i <= 10; i++)
+      env.put(
+          "SECURITIES_DEMO_USER" + i + "_PASSWORD",
+          i == 1 ? buyerPassword : i == 2 ? sellerPassword : UUID.randomUUID().toString());
+    env.put("SECURITIES_OUTPUT_SEND_ENABLED", "true");
+    processes.put(
+        module,
+        builder
+            .redirectErrorStream(true)
+            .redirectOutput(logs.resolve(module + "-" + System.nanoTime() + ".log").toFile())
+            .start());
+  }
+
+  /** 验证入金、非空记录助手展示及身份隔离；强制终止引擎后资金与流水不重复。 */
+  private void verifyDeposits(HttpClient newcomer,HttpClient other) throws Exception {
+    String token=tree(send(newcomer,"GET","/session",null,null,null)).path("csrf").asText();
+    assertEquals(401,send(client(),"GET","/api/v1/deposits",null,null,null).statusCode());
+    assertEquals(403,send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"1000.00\"}",null,"deposit-denied").statusCode());
+    assertEquals(400,send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"1.001\"}",token,"deposit-invalid").statusCode());
+    var created=send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"1000.00\",\"userId\":1000}",token,"new-user-deposit");
+    assertEquals(202,created.statusCode());
+    String id=tree(created).path("depositId").asText();
+    await(()->tree(send(newcomer,"GET","/api/v1/deposits/"+id,null,null,null)).path("status").asText().equals("SUCCEEDED"),"新用户入金到账");
+    amount("1000",tree(send(newcomer,"GET","/api/v1/account",null,null,null)).path("cash").path("available"));
+    assertEquals(404,send(other,"GET","/api/v1/deposits/"+id,null,null,null).statusCode());
+    assertEquals(409,send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"1001\"}",token,"new-user-deposit").statusCode());
+    assertEquals(id,tree(send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"1000\"}",token,"new-user-deposit")).path("depositId").asText());
+    int eventsBefore=count("SELECT COUNT(*) FROM events"),flowsBefore=count("SELECT COUNT(*) FROM transfer_logs");
+    // 助手只能读本人事实；猜中他人入金编号仍拒绝，解释请求不产生事件。
+    assertEquals(401,send(client(),"GET","/api/v1/assistant/status",null,null,null).statusCode());
+    assertEquals(403,send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"账户余额\"}",null,null).statusCode());
+    assertEquals(200,send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"账户冻结\"}",token,null).statusCode());
+    verifyAssistantDeposits(newcomer,token,1);
+    verifyAssistantPhaseTwo(newcomer,token);
+    var detail=send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"入金状态\",\"depositId\":\""+id+"\"}",token,null);
+    assertEquals(200,detail.statusCode(),detail.body());
+    assertEquals("1000.00",tree(detail).path("tables").path(0).path("rows").path(0).path(0).asText());
+    var ownOrders=tree(send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"我的所有订单\"}",token,null));
+    assertEquals(0,ownOrders.path("facts").path("activeOrders").size());
+    assertEquals("0",ownOrders.path("facts").path("finished").path("total").asText());
+    assertEquals("CLARIFICATION",tree(send(newcomer,"POST","/api/v1/assistant/explain","{\"question\":\"星河和青山的订单\"}",token,null)).path("mode").asText());
+    String otherToken=tree(send(other,"GET","/session",null,null,null)).path("csrf").asText();
+    assertEquals(404,send(other,"POST","/api/v1/assistant/explain","{\"question\":\"入金状态\",\"depositId\":\""+id+"\"}",otherToken,null).statusCode());
+    assertEquals(eventsBefore,count("SELECT COUNT(*) FROM events"));
+    var process=processes.remove("trading-engine");process.destroyForcibly();assertTrue(process.waitFor(12,TimeUnit.SECONDS));
+    // 引擎不可用期间先持久登记，不能依赖用户再点一次来触发发送。
+    var pending=send(newcomer,"POST","/api/v1/deposits","{\"amount\":\"25.00\"}",token,"while-engine-down");
+    assertEquals(202,pending.statusCode());String next=tree(pending).path("depositId").asText();
+    stop("trading-api");start("trading-api",false);
+    start("trading-engine",false);
+    await(()->status("trading-engine","/internal/securities/status")==200,"入金后引擎恢复");
+    await(()->tree(send(newcomer,"GET","/api/v1/deposits/"+next,null,null,null)).path("status").asText().equals("SUCCEEDED"),"API 重启从发件箱继续入金");
+    amount("1025",tree(send(newcomer,"GET","/api/v1/account",null,null,null)).path("cash").path("available"));
+    assertEquals(eventsBefore+1,count("SELECT COUNT(*) FROM events"));
+    assertEquals(flowsBefore+1,count("SELECT COUNT(*) FROM transfer_logs"));
+    assertEquals(2,tree(send(newcomer,"GET","/api/v1/deposits",null,null,null)).size());
+    verifyAssistantDeposits(newcomer,token,2);
+    assertEquals(eventsBefore+1,count("SELECT COUNT(*) FROM events"));
+    assertEquals(flowsBefore+1,count("SELECT COUNT(*) FROM transfer_logs"));
+  }
+
+  /** 真实代理链读取非空入金列表，核对日期、金额和状态，不允许把转换失败当成正常提示。 */
+  private void verifyAssistantDeposits(HttpClient user,String token,int expected) throws Exception {
+    var history=tree(send(user,"GET","/api/v1/deposits",null,null,null));
+    var reply=send(user,"POST","/api/v1/assistant/explain","{\"question\":\"我的入金情况\"}",token,null);
+    assertEquals(200,reply.statusCode(),reply.body());var answer=tree(reply);
+    assertEquals("DEPOSIT",answer.path("intent").asText());
+    assertEquals(expected,answer.path("facts").path("records").size());
+    var rows=answer.path("tables").path(0).path("rows");assertEquals(expected,rows.size());
+    for(int i=0;i<expected;i++){
+      assertTrue(answer.path("facts").path("records").path(i).path("quotaDate").asText().matches("\\d{4}-\\d{2}-\\d{2}"));
+      amount(history.path(i).path("amount").asText(),rows.path(i).path(0));
+      assertEquals("已到账",rows.path(i).path(1).asText());
+    }
+  }
+
+  /** 用真实 Session/CSRF 读取行情和知识，逐证券与 SQL 对照，且不能增加事件或资金流水。 */
+  private void verifyAssistantPhaseTwo(HttpClient user,String token) throws Exception {
+    await(()->count("SELECT sequenceId FROM projection_offsets WHERE name='quotation'")==count("SELECT sequenceId FROM engine_output_checkpoint WHERE id=1"),"助手行情投影追平");
+    int before=count("SELECT COUNT(*) FROM events"),flows=count("SELECT COUNT(*) FROM transfer_logs");
+    var reply=send(user,"POST","/api/v1/assistant/explain","{\"question\":\"五只股票最近24小时行情\"}",token,null);assertEquals(200,reply.statusCode(),reply.body());var answer=tree(reply);assertEquals("MARKET",answer.path("intent").asText());var facts=answer.path("facts");assertEquals(5,facts.path("markets").size());assertFalse(facts.has("cash"));
+    for(var row:facts.path("markets")){
+      long id=jdbc.queryForObject("SELECT securityId FROM securities WHERE symbol=?",Long.class,row.path("symbol").asText());
+      int total=jdbc.queryForObject("SELECT COUNT(*) FROM ticks WHERE securityId=? AND createdAt>=? AND createdAt<?",Integer.class,id,facts.path("from").asLong(),facts.path("to").asLong());assertEquals(total,row.path("count").asInt());
+      if(total>0){String sum=jdbc.queryForObject("SELECT SUM(price*quantity) FROM ticks WHERE securityId=? AND createdAt>=? AND createdAt<?",java.math.BigDecimal.class,id,facts.path("from").asLong(),facts.path("to").asLong()).toPlainString();amount(sum,row.path("amount"));}
+    }
+    var single=tree(send(user,"POST","/api/v1/assistant/explain","{\"question\":\"星河最近行情怎么样\"}",token,null));assertEquals(1,single.path("facts").path("markets").size());assertEquals("STAR",single.path("facts").path("markets").path(0).path("symbol").asText());
+    var guide=send(user,"POST","/api/v1/assistant/explain","{\"question\":\"我该怎么充值\"}",token,null);assertEquals(200,guide.statusCode(),guide.body());var knowledge=tree(guide);assertEquals("KNOWLEDGE",knowledge.path("intent").asText());assertEquals("模拟入金",knowledge.path("sources").path(0).path("title").asText());assertFalse(knowledge.path("facts").has("records"));
+    assertEquals("TIME_FILTER_NOT_SUPPORTED",tree(send(user,"POST","/api/v1/assistant/explain","{\"question\":\"星河今天行情\"}",token,null)).path("fallbackReason").asText());
+    assertEquals("KNOWLEDGE_NOT_FOUND",tree(send(user,"POST","/api/v1/assistant/explain","{\"question\":\"如何办理IPO\"}",token,null)).path("fallbackReason").asText());
+    assertEquals(before,count("SELECT COUNT(*) FROM events"));assertEquals(flows,count("SELECT COUNT(*) FROM transfer_logs"));
+  }
+
+  /** 只停止本测试拥有的应用，不触碰用户已启动的 Java 服务。 */
+  private void stop(String module) throws Exception {
+    var process = processes.remove(module);
+    if (process != null && process.isAlive()) {
+      process.destroy();
+      if (!process.waitFor(12, TimeUnit.SECONDS)) {
+        process.destroyForcibly();
+        process.waitFor(12, TimeUnit.SECONDS);
+      }
+    }
+  }
+
+  /** 可选的真正 Chromium 页面测试，不用 HTTP 测试冒充浏览器渲染。 */
+  private void browser() throws Exception {
+    String container = "securities-gateway-test-" + UUID.randomUUID().toString().replace("-", "");
+    try {
+      if (gatewayTest()) {
+        Path conf = Files.createDirectory(logs.resolve("nginx-conf"));
+        Files.writeString(
+            conf.resolve("exchange.conf"),
+            Files.readString(root.resolve("build/nginx/conf.d/exchange.conf"))
+                .replace("host.docker.internal:8100", "host.docker.internal:" + ports.get("ui"))
+                .replace("host.docker.internal:8106", "host.docker.internal:" + ports.get("push")));
+        docker(
+            "run",
+            "-d",
+            "--name",
+            container,
+            "--network",
+            "stock-exchange-securities_default",
+            "-p",
+            "127.0.0.1:" + ports.get("gateway") + ":80",
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            "-v",
+            root.resolve("build/nginx/nginx.conf") + ":/etc/nginx/nginx.conf:ro",
+            "-v",
+            conf + ":/etc/nginx/conf.d:ro",
+            "nginx:1.28.3-alpine");
+        await(() -> status("gateway", "/session") == 200, "网关到本机回环 UI");
+        for (String path :
+            List.of("/internal/securities/status", "/actuator/health", "/v3/api-docs", "/unknown"))
+          assertEquals(404, status("gateway", path), path);
+        assertEquals(401, status("gateway", "/api/v1/account"));
+        assertEquals(
+            401,
+            probe
+                .send(
+                    HttpRequest.newBuilder(URI.create(base("gateway") + "/api/v1/account"))
+                        .header("Authorization", "Bearer cannot-replace-session")
+                        .header("X-Forwarded-For", "198.51.100.7")
+                        .GET()
+                        .build(),
+                    HttpResponse.BodyHandlers.discarding())
+                .statusCode());
+        assertEquals(403, status("gateway", "/ws?ticket=gateway-log-redaction-sentinel"));
+        assertEquals(
+            403,
+            probe
+                .send(
+                    HttpRequest.newBuilder(URI.create(base("gateway") + "/auth/signin"))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString("{}"))
+                        .build(),
+                    HttpResponse.BodyHandlers.discarding())
+                .statusCode());
+      }
+      var builder =
+          new ProcessBuilder("node", root.resolve("ui/src/test/js/browser.mjs").toString());
+      var env = builder.environment();
+      env.put("SECURITIES_BROWSER_URL", base(gatewayTest() ? "gateway" : "ui"));
+      env.put("SECURITIES_BROWSER_BUYER_PASSWORD", buyerPassword);
+      env.put("SECURITIES_BROWSER_SELLER_PASSWORD", sellerPassword);
+      env.put("SECURITIES_BROWSER_OUTPUT", logs.toString());
+      var process =
+          builder
+              .redirectErrorStream(true)
+              .redirectOutput(logs.resolve("browser.log").toFile())
+              .start();
+      try {
+        assertTrue(process.waitFor(120, TimeUnit.SECONDS), "浏览器测试超时：" + logs);
+        assertEquals(0, process.exitValue(), Files.readString(logs.resolve("browser.log")));
+      } finally {
+        if (process.isAlive()) {
+          process
+              .descendants()
+              .forEach(
+                  child -> {
+                    /* 超时只终止本测试 Node 的浏览器子进程，不按进程名称广泛清理。 */
+                    child.destroyForcibly();
+                  });
+          process.destroyForcibly();
+          process.waitFor(10, TimeUnit.SECONDS);
+        }
+      }
+    } finally {
+      if (gatewayTest()) {
+        try {
+          docker("logs", container);
+          assertFalse(
+              Files.readString(logs.resolve("gateway-docker.log"))
+                  .contains("gateway-log-redaction-sentinel"),
+              "不能把 WebSocket 查询票据写入访问或错误日志");
+        } finally {
+          docker("rm", "-f", container);
+        }
+      }
+    }
+  }
+
+  /** 仅显式开关开启隔离网关，普通浏览器验收不要求额外容器。 */
+  private boolean gatewayTest() {
+    return "true".equals(System.getenv("SECURITIES_TEST_GATEWAY"));
+  }
+
+  /** 只管理本方法生成的 UUID 容器，不接触开发网关或数据库容器。 */
+  private void docker(String... args) throws Exception {
+    var command = new ArrayList<String>();
+    command.add("docker");
+    command.addAll(List.of(args));
+    var process =
+        new ProcessBuilder(command)
+            .redirectErrorStream(true)
+            .redirectOutput(
+                ProcessBuilder.Redirect.appendTo(logs.resolve("gateway-docker.log").toFile()))
+            .start();
+    assertTrue(process.waitFor(90, TimeUnit.SECONDS), "隔离网关 Docker 操作超时");
+    assertEquals(0, process.exitValue(), "隔离网关操作失败，查看 gateway-docker.log");
+  }
+
+  /** JSON 仅在断言内部解析，密码不输出到测试日志。 */
+  private JsonNode tree(HttpResponse<String> response) throws Exception {
+    return json.readTree(response.body());
+  }
+
+  /** 十进制断言不能用 double 比较金融结果。 */
+  private void amount(String expected, JsonNode value) {
+    assertEquals(
+        0, new java.math.BigDecimal(expected).compareTo(new java.math.BigDecimal(value.asText())));
+  }
+
+  /** 单行计数帮助等待实际数据库状态。 */
+  private int count(String sql) {
+    return jdbc.queryForObject(sql, Integer.class);
+  }
+
+  /** 随机回环端口避免占用已运行的业务入口。 */
+  private int port() throws Exception {
+    try (var server = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
+      return server.getLocalPort();
+    }
+  }
+
+  /** 固定本机目标，浏览器不能修改上游地址。 */
+  private String base(String module) {
+    return "http://127.0.0.1:" + ports.get(module);
+  }
+
+  /** 探测状态仅用于等待，不把端口打开视为交易完成。 */
+  private int status(String module, String path) {
+    try {
+      return probe
+          .send(
+              HttpRequest.newBuilder(URI.create(base(module) + path))
+                  .timeout(Duration.ofSeconds(2))
+                  .GET()
+                  .build(),
+              HttpResponse.BodyHandlers.discarding())
+          .statusCode();
+    } catch (Exception failure) {
+      return 503;
+    }
+  }
+
+  /** 有界等待可观察条件，失败提供进程日志目录。 */
+  private void await(Check check, String description) throws Exception {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(100);
+    while (System.nanoTime() < deadline) {
+      try {
+        if (check.test()) return;
+      } catch (Exception transientFailure) {
+        /* 容许进程与投影短暂落后。 */
+      }
+      Thread.sleep(100);
+    }
+    fail(description + "超时，日志：" + logs);
+  }
+
+  private interface Check {
+    /** 条件允许真实网络和数据库调用。 */
+    boolean test() throws Exception;
+  }
+}

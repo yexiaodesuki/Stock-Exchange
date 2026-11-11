@@ -1,0 +1,9 @@
+# 证券 engine 专属配置；仅非敏感参数通过配置中心分发。
+server:
+  port: ${SECURITIES_ENGINE_PORT:8102}
+management:
+  server:
+    port: ${SECURITIES_ENGINE_MANAGEMENT_PORT:18102}
+securities:
+  snapshot-interval-ms: ${SECURITIES_SNAPSHOT_INTERVAL_MS:60000}
+  send-enabled: ${SECURITIES_OUTPUT_SEND_ENABLED:true}

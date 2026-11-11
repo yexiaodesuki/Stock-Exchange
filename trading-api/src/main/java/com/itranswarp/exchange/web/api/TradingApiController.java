@@ -1,314 +1,169 @@
-/* 交易与行情入口：保留业务语义，观测异步等待、超时和迟到结果，不泄露请求维度。 */
+/* 证券 API：身份取自签名，现金回源引擎，行情缓存失败回 MySQL；不暴露配给命令。 */
 package com.itranswarp.exchange.web.api;
 
-import java.io.IOException;
-import java.util.List;
-import java.util.Map;
-import java.util.StringJoiner;
-import java.util.concurrent.ConcurrentHashMap;
-
-import jakarta.annotation.PostConstruct;
-
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.HttpStatus;
+import com.fasterxml.jackson.databind.*;
+import com.itranswarp.exchange.enums.Direction;
+import com.itranswarp.exchange.securities.*;
+import com.itranswarp.exchange.securities.SecuritiesProtocol.*;
+import com.itranswarp.exchange.securities.output.*;
+import java.math.BigDecimal;
+import java.util.*;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.ResponseBody;
-import org.springframework.web.bind.annotation.RestController;
-import org.springframework.web.context.request.async.DeferredResult;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.itranswarp.exchange.ApiError;
-import com.itranswarp.exchange.ApiErrorResponse;
-import com.itranswarp.exchange.ApiException;
-import com.itranswarp.exchange.bean.OrderBookBean;
-import com.itranswarp.exchange.bean.OrderRequestBean;
-import com.itranswarp.exchange.bean.SimpleMatchDetailRecord;
-import com.itranswarp.exchange.ctx.UserContext;
-import com.itranswarp.exchange.message.ApiResultMessage;
-import com.itranswarp.exchange.message.event.OrderCancelEvent;
-import com.itranswarp.exchange.message.event.OrderRequestEvent;
-import com.itranswarp.exchange.model.trade.OrderEntity;
-import com.itranswarp.exchange.redis.RedisCache;
-import com.itranswarp.exchange.redis.RedisService;
-import com.itranswarp.exchange.service.TradingEngineApiProxyService;
-import com.itranswarp.exchange.support.AbstractApiController;
-import com.itranswarp.exchange.service.HistoryService;
-import com.itranswarp.exchange.service.SendEventService;
-import com.itranswarp.exchange.util.IdUtil;
-import com.itranswarp.exchange.util.JsonUtil;
+import org.springframework.web.bind.annotation.*;
 
 @RestController
-@RequestMapping("/api")
-public class TradingApiController extends AbstractApiController {
+@RequestMapping("/api/v1")
+public final class TradingApiController {
+  private final SecurityCatalog catalog;
+  private final com.itranswarp.exchange.service.ApiAuthenticationService authentication;
+  private final com.itranswarp.exchange.service.TradingEngineApiProxyService engineProxy;
+  private final com.itranswarp.exchange.service.HistoryService historyService;
+  private final com.itranswarp.exchange.service.MarketQueryService marketQueries;
+  private final com.itranswarp.exchange.service.SendEventService sender;
 
-    @Autowired
-    private com.itranswarp.exchange.service.ApiRequestMonitoring requestMonitoring =
-            new com.itranswarp.exchange.service.ApiRequestMonitoring(new com.itranswarp.exchange.monitoring.PipelineMonitoring());
+  /** 应用正常装配使用构造器注入，控制器不创建存储或消息客户端。 */
+  public TradingApiController(
+      SecurityCatalog catalog,
+      com.itranswarp.exchange.service.ApiAuthenticationService authentication,
+      com.itranswarp.exchange.service.TradingEngineApiProxyService engineProxy,
+      com.itranswarp.exchange.service.HistoryService historyService,
+      com.itranswarp.exchange.service.MarketQueryService marketQueries,
+      com.itranswarp.exchange.service.SendEventService sender) {
+    this.catalog = catalog;
+    this.authentication = authentication;
+    this.engineProxy = engineProxy;
+    this.historyService = historyService;
+    this.marketQueries = marketQueries;
+    this.sender = sender;
+  }
 
-    @Autowired
-    private HistoryService historyService;
+  /** 目录可公开读取，不生成任何用户资产。 */
+  @GetMapping("/securities")
+  public Object securities() {
+    return catalog.all();
+  }
 
-    @Autowired
-    private SendEventService sendEventService;
+  /** 账户必须是本人；不允许 URL/请求体指定另一用户标识。 */
+  @GetMapping("/account")
+  public Object account(@RequestHeader(value = "Authorization", required = false) String auth) {
+    return WireJson.tree(engineProxy.internal("/accounts/" + authentication.user(auth)));
+  }
 
-    @Autowired
-    private RedisService redisService;
+  /** 活动订单来自已就绪引擎，历史不能冒充当前挂单。 */
+  @GetMapping("/orders")
+  public Object orders(
+      @RequestHeader(value = "Authorization", required = false) String auth,
+      @RequestParam long securityId) {
+    catalog.require(securityId);
+    return WireJson.tree(
+        engineProxy.internal(
+            "/accounts/" + authentication.user(auth) + "/orders?securityId=" + securityId));
+  }
 
-    @Autowired
-    private ObjectMapper objectMapper;
+  /** 历史只过滤本人的指定证券，包含成交和撤销最终状态。 */
+  @GetMapping("/history/orders")
+  public Object history(
+      @RequestHeader(value = "Authorization", required = false) String auth,
+      @RequestParam long securityId,
+      @RequestParam(defaultValue = "100") int limit) {
+    return historyService.history(authentication.user(auth), securityId, limit);
+  }
 
-    @Autowired
-    private TradingEngineApiProxyService tradingEngineApiProxyService;
+  /** 本人的订单才可读取成交明细；不向客户端暴露对手用户标识。 */
+  @GetMapping("/orders/{order}/matches")
+  public Object matches(
+      @RequestHeader(value = "Authorization", required = false) String auth,
+      @PathVariable long order,
+      @RequestParam long securityId) {
+    return historyService.matches(authentication.user(auth), order, securityId);
+  }
 
-    private Long asyncTimeout = Long.valueOf(500);
+  /** 盘口比较该证券版本而非全局成交位置，旧缓存不能覆盖撤单后的盘口。 */
+  @GetMapping("/securities/{security}/orderbook")
+  public Object book(@PathVariable long security) throws Exception {
+    return marketQueries.book(security);
+  }
 
-    private String timeoutJson = null;
+  /** 最近成交优先缓存，缓存异常时从持久 Tick 回源。 */
+  @GetMapping("/securities/{security}/ticks")
+  public Object ticks(@PathVariable long security, @RequestParam(defaultValue = "100") int limit)
+      throws Exception {
+    return marketQueries.ticks(security, limit);
+  }
 
-    Map<String, DeferredResult<ResponseEntity<String>>> deferredResultMap = new ConcurrentHashMap<>();
+  /** 长区间/超过缓存窗口请求回 MySQL，日线不会错误读取小时表。 */
+  @GetMapping("/securities/{security}/bars/{period}")
+  public Object bars(
+      @PathVariable long security,
+      @PathVariable String period,
+      @RequestParam(defaultValue = "0") long from,
+      @RequestParam(defaultValue = "9223372036854775807") long to,
+      @RequestParam(defaultValue = "200") int limit)
+      throws Exception {
+    return marketQueries.bars(security, period, from, to, limit);
+  }
 
-    private String getTimeoutJson() throws IOException {
-        if (timeoutJson == null) {
-            timeoutJson = this.objectMapper
-                    .writeValueAsString(new ApiErrorResponse(ApiError.OPERATION_TIMEOUT, null, ""));
-        }
-        return timeoutJson;
-    }
+  public record OrderBody(
+      long securityId, Direction direction, BigDecimal price, BigDecimal quantity) {}
 
-    @PostConstruct
-    public void init() {
-        this.redisService.subscribe(RedisCache.Topic.TRADING_API_RESULT, this::onApiResultMessage);
-    }
+  /** 下单只允许已认证用户，通过服务器绑定的幂等键提交；不接受 userId 或配给字段。 */
+  @PostMapping("/orders")
+  public ResponseEntity<?> place(
+      @RequestHeader(value = "Authorization", required = false) String auth,
+      @RequestHeader("Idempotency-Key") String key,
+      @RequestBody OrderBody body) {
+    long user = authentication.user(auth);
+    var command =
+        new PlaceOrder(body.securityId(), body.direction(), body.price(), body.quantity());
+    command.validate(catalog);
+    return sender.submit(user, key, command);
+  }
 
-    @GetMapping("/timestamp")
-    public Map<String, Long> timestamp() {
-        return Map.of("timestamp", Long.valueOf(System.currentTimeMillis()));
-    }
+  /** 撤单证券必填，最终归属由引擎再次检查，不信任 HTTP 预检。 */
+  @PostMapping("/orders/{order}/cancel")
+  public ResponseEntity<?> cancel(
+      @RequestHeader(value = "Authorization", required = false) String auth,
+      @RequestHeader("Idempotency-Key") String key,
+      @PathVariable long order,
+      @RequestParam long securityId) {
+    catalog.require(securityId);
+    return sender.submit(authentication.user(auth), key, new CancelOrder(securityId, order));
+  }
 
-    @ResponseBody
-    @GetMapping(value = "/assets", produces = "application/json")
-    public String getAssets() throws IOException {
-        return tradingEngineApiProxyService.get("/internal/" + UserContext.getRequiredUserId() + "/assets");
-    }
+  /** 本人请求才可查询，持久输出存在且引擎已应用才返回最终结果。 */
+  @GetMapping("/requests/{request}")
+  public ResponseEntity<?> result(
+      @RequestHeader(value = "Authorization", required = false) String auth,
+      @PathVariable String request) {
+    return sender.result(authentication.user(auth), request);
+  }
 
-    @ResponseBody
-    @GetMapping(value = "/orders/{orderId}", produces = "application/json")
-    public String getOpenOrder(@PathVariable("orderId") Long orderId) throws IOException {
-        final Long userId = UserContext.getRequiredUserId();
-        return tradingEngineApiProxyService.get("/internal/" + userId + "/orders/" + orderId);
-    }
+  /** 只给已认证用户签一次性连接票据，Redis 不可用时明确失败。 */
+  @PostMapping("/ws-ticket")
+  public Object ticket(@RequestHeader(value = "Authorization", required = false) String auth) {
+    return authentication.ticket(auth);
+  }
 
-    @ResponseBody
-    @GetMapping(value = "/orders", produces = "application/json")
-    public String getOpenOrders() throws IOException {
-        return tradingEngineApiProxyService.get("/internal/" + UserContext.getRequiredUserId() + "/orders");
-    }
+  /** API 健康需要核心可服务，Redis 是可降级缓存，不作为账户健康的唯一依据。 */
+  public boolean ready() {
+    return engineProxy.ready();
+  }
 
-    /** 先确认引擎恢复完成，避免将恢复前残留的 Redis 盘口当成当前可交易状态。 */
-    @ResponseBody
-    @GetMapping(value = "/orderBook", produces = "application/json")
-    public String getOrderBook() {
-        tradingEngineApiProxyService.requireReady();
-        String data = redisService.get(RedisCache.Key.ORDER_BOOK);
-        return data == null ? OrderBookBean.EMPTY : data;
-    }
+  /** 参数错误明确返回 400，缓存/数据库故障不冒充正常空数组。 */
+  @ExceptionHandler(IllegalArgumentException.class)
+  public ResponseEntity<?> invalid(IllegalArgumentException failure) {
+    return ResponseEntity.badRequest().body(Map.of("error", "INVALID_PARAMETER"));
+  }
 
-    @ResponseBody
-    @GetMapping(value = "/ticks", produces = "application/json")
-    public String getRecentTicks() {
-        List<String> data = redisService.lrange(RedisCache.Key.RECENT_TICKS, 0, -1);
-        if (data == null || data.isEmpty()) {
-            return "[]";
-        }
-        StringJoiner sj = new StringJoiner(",", "[", "]");
-        for (String t : data) {
-            sj.add(t);
-        }
-        return sj.toString();
-    }
+  /** 未分类依赖故障保持不可用，不泄露内部堆栈或凭据。 */
+  @ExceptionHandler(org.springframework.dao.DataAccessException.class)
+  public ResponseEntity<?> storageFailure() {
+    return ResponseEntity.status(503).body(Map.of("error", "STORAGE_UNAVAILABLE"));
+  }
 
-    @ResponseBody
-    @GetMapping(value = "/bars/day", produces = "application/json")
-    public String getDayBars() {
-        long end = System.currentTimeMillis();
-        long start = end - 366 * 86400_000;
-        return getBars(RedisCache.Key.HOUR_BARS, start, end);
-    }
-
-    @ResponseBody
-    @GetMapping(value = "/bars/hour", produces = "application/json")
-    public String getHourBars() {
-        long end = System.currentTimeMillis();
-        long start = end - 720 * 3600_000;
-        return getBars(RedisCache.Key.HOUR_BARS, start, end);
-    }
-
-    @ResponseBody
-    @GetMapping(value = "/bars/min", produces = "application/json")
-    public String getMinBars() {
-        long end = System.currentTimeMillis();
-        long start = end - 1440 * 60_000;
-        return getBars(RedisCache.Key.MIN_BARS, start, end);
-    }
-
-    @ResponseBody
-    @GetMapping(value = "/bars/sec", produces = "application/json")
-    public String getSecBars() {
-        long end = System.currentTimeMillis();
-        long start = end - 3600 * 1_000;
-        return getBars(RedisCache.Key.SEC_BARS, start, end);
-    }
-
-    private String getBars(String key, long start, long end) {
-        List<String> data = redisService.zrangebyscore(key, start, end);
-        if (data == null || data.isEmpty()) {
-            return "[]";
-        }
-        StringJoiner sj = new StringJoiner(",", "[", "]");
-        for (String t : data) {
-            sj.add(t);
-        }
-        return sj.toString();
-    }
-
-    @GetMapping("/history/orders")
-    public List<OrderEntity> getHistoryOrders(
-            @RequestParam(value = "maxResults", defaultValue = "100") int maxResults) {
-        if (maxResults < 1 || maxResults > 1000) {
-            throw new ApiException(ApiError.PARAMETER_INVALID, "maxResults", "Invalid parameter.");
-        }
-        return historyService.getHistoryOrders(UserContext.getRequiredUserId(), maxResults);
-    }
-
-    @GetMapping("/history/orders/{orderId}/matches")
-    public List<SimpleMatchDetailRecord> getOrderMatchDetails(@PathVariable("orderId") Long orderId) throws Exception {
-        final Long userId = UserContext.getRequiredUserId();
-        // 查找活动Order:
-        String strOpenOrder = tradingEngineApiProxyService.get("/internal/" + userId + "/orders/" + orderId);
-        if (strOpenOrder.equals("null")) {
-            // 查找历史Order:
-            OrderEntity orderEntity = this.historyService.getHistoryOrder(userId, orderId);
-            if (orderEntity == null) {
-                // Order未找到:
-                throw new ApiException(ApiError.ORDER_NOT_FOUND, orderId.toString(), "Order not found.");
-            }
-        }
-        return this.historyService.getHistoryMatchDetails(orderId);
-    }
-
-    /** 撤单前检查归属与就绪；所有等待终止路径都清理一次观测项。 */
-    @PostMapping(value = "/orders/{orderId}/cancel", produces = "application/json")
-    @ResponseBody
-    public DeferredResult<ResponseEntity<String>> cancelOrder(@PathVariable("orderId") Long orderId) throws Exception {
-        final Long userId = UserContext.getRequiredUserId();
-        String orderStr = tradingEngineApiProxyService.get("/internal/" + userId + "/orders/" + orderId);
-        if (orderStr.equals("null")) {
-            throw new ApiException(ApiError.ORDER_NOT_FOUND, orderId.toString(), "Active order not found.");
-        }
-        final String refId = IdUtil.generateUniqueId();
-        var message = new OrderCancelEvent();
-        message.refId = refId;
-        message.refOrderId = orderId;
-        message.userId = userId;
-        message.createdAt = System.currentTimeMillis();
-        ResponseEntity<String> timeout = new ResponseEntity<>(getTimeoutJson(), HttpStatus.BAD_REQUEST);
-        DeferredResult<ResponseEntity<String>> deferred = new DeferredResult<>(this.asyncTimeout, timeout);
-        deferred.onTimeout(() -> {
-            logger.warn("deferred order {} cancel request refId={} timeout.", orderId, refId);
-            this.deferredResultMap.remove(refId);
-            this.requestMonitoring.finished(refId, "timeout");
-        });
-        // track deferred:
-        this.deferredResultMap.put(refId, deferred);
-        this.requestMonitoring.started(refId, "cancel");
-        // 容器完成回调兜底清理，正常结果已完成时不会重复计数。
-        deferred.onCompletion(() -> {
-            this.deferredResultMap.remove(refId, deferred);
-            this.requestMonitoring.finished(refId, "completed_without_result");
-        });
-        logger.info("cancel order message created: {}", message);
-        try {
-            this.sendEventService.sendMessage(message);
-        } catch (RuntimeException e) {
-            this.deferredResultMap.remove(refId);
-            this.requestMonitoring.finished(refId, "send_failure");
-            throw e;
-        }
-        return deferred;
-    }
-
-    /** 下单保留原有门控和响应，观测发送失败、超时和正常结果且不重复计数。 */
-    @PostMapping(value = "/orders", produces = "application/json")
-    @ResponseBody
-    public DeferredResult<ResponseEntity<String>> createOrder(@RequestBody OrderRequestBean orderRequest)
-            throws IOException {
-        final Long userId = UserContext.getRequiredUserId();
-        orderRequest.validate();
-        tradingEngineApiProxyService.requireReady();
-        final String refId = IdUtil.generateUniqueId();
-        var event = new OrderRequestEvent();
-        event.refId = refId;
-        event.userId = userId;
-        event.direction = orderRequest.direction;
-        event.price = orderRequest.price;
-        event.quantity = orderRequest.quantity;
-        event.createdAt = System.currentTimeMillis();
-
-        ResponseEntity<String> timeout = new ResponseEntity<>(getTimeoutJson(), HttpStatus.BAD_REQUEST);
-        DeferredResult<ResponseEntity<String>> deferred = new DeferredResult<>(this.asyncTimeout, timeout);
-        deferred.onTimeout(() -> {
-            logger.warn("deferred order request refId = {} timeout.", event.refId);
-            this.deferredResultMap.remove(event.refId);
-            this.requestMonitoring.finished(event.refId, "timeout");
-        });
-        // track deferred:
-        this.deferredResultMap.put(event.refId, deferred);
-        this.requestMonitoring.started(event.refId, "create");
-        // 完成不等于下单成功，仅清理尚未通过其他路径终止的观测。
-        deferred.onCompletion(() -> {
-            this.deferredResultMap.remove(event.refId, deferred);
-            this.requestMonitoring.finished(event.refId, "completed_without_result");
-        });
-        try {
-            this.sendEventService.sendMessage(event);
-        } catch (RuntimeException e) {
-            this.deferredResultMap.remove(event.refId);
-            this.requestMonitoring.finished(event.refId, "send_failure");
-            throw e;
-        }
-        return deferred;
-    }
-
-    // message callback ///////////////////////////////////////////////////////
-
-    /** Redis 结果只有成功设置响应时才算收到结果，迟到或重复结果不重复完成请求。 */
-    public void onApiResultMessage(String msg) {
-        logger.info("on subscribed message: {}", msg);
-        try {
-            ApiResultMessage message = objectMapper.readValue(msg, ApiResultMessage.class);
-            if (message.refId != null) {
-                DeferredResult<ResponseEntity<String>> deferred = this.deferredResultMap.remove(message.refId);
-                if (deferred != null) {
-                    if (message.error != null) {
-                        String error = objectMapper.writeValueAsString(message.error);
-                        ResponseEntity<String> resp = new ResponseEntity<>(error, HttpStatus.BAD_REQUEST);
-                        boolean accepted = deferred.setResult(resp);
-                        this.requestMonitoring.finished(message.refId, accepted ? "rejected" : "expired");
-                    } else {
-                        ResponseEntity<String> resp = new ResponseEntity<>(JsonUtil.writeJson(message.result),
-                                HttpStatus.OK);
-                        boolean accepted = deferred.setResult(resp);
-                        this.requestMonitoring.finished(message.refId, accepted ? "success" : "expired");
-                    }
-                }
-            }
-        } catch (Exception e) {
-            logger.error("Invalid ApiResultMessage: " + msg, e);
-        }
-    }
+  /** 校验失败不能把持久结果说成执行成功，明确不可用并交由后台诊断。 */
+  @ExceptionHandler(IllegalStateException.class)
+  public ResponseEntity<?> invalidState() {
+    return ResponseEntity.status(503).body(Map.of("error", "STATE_UNAVAILABLE"));
+  }
 }

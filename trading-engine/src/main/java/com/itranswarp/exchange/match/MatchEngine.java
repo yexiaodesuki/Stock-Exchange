@@ -1,111 +1,72 @@
+/* 分证券撮合领域服务：保留原价格时间优先、Maker 价格和成交顺序。 */
 package com.itranswarp.exchange.match;
 
-import java.math.BigDecimal;
+import static com.itranswarp.exchange.core.EngineState.number;
 
-import org.springframework.stereotype.Component;
-
-import com.itranswarp.exchange.bean.OrderBookBean;
+import com.itranswarp.exchange.clearing.ClearingService;
+import com.itranswarp.exchange.core.*;
+import com.itranswarp.exchange.core.EngineState.Order;
 import com.itranswarp.exchange.enums.Direction;
-import com.itranswarp.exchange.enums.OrderStatus;
-import com.itranswarp.exchange.model.trade.OrderEntity;
+import com.itranswarp.exchange.order.OrderService;
+import com.itranswarp.exchange.securities.SecuritiesProtocol.*;
+import com.itranswarp.exchange.securities.output.ExecutionEnvelope;
+import java.math.BigDecimal;
+import java.util.*;
 
-@Component
-public class MatchEngine {
+public final class MatchEngine {
+  private final ClearingService clearing;
 
-    public final OrderBook buyBook = new OrderBook(Direction.BUY);
-    public final OrderBook sellBook = new OrderBook(Direction.SELL);
-    public BigDecimal marketPrice = BigDecimal.ZERO; // 最新市场价
-    private long sequenceId;
+  /** 清算组件无状态，所有修改使用同一个候选上下文。 */
+  public MatchEngine(ClearingService clearing) {
+    this.clearing = clearing;
+  }
 
-    public MatchResult processOrder(long sequenceId, OrderEntity order) {
-        return switch (order.direction) {
-        case BUY -> processOrder(sequenceId, order, this.sellBook, this.buyBook);
-        case SELL -> processOrder(sequenceId, order, this.buyBook, this.sellBook);
-        default -> throw new IllegalArgumentException("Invalid direction.");
-        };
+  /** 接收已经冻结并创建的订单，撮合后更新候选索引和盘口进度。 */
+  public ExecutionResult processOrder(EngineState next, SequencedEvent event, Order taker) {
+    var market = next.market(taker.security());
+    var opposing = taker.direction() == Direction.BUY ? market.sell() : market.buy();
+    var trades = new ArrayList<ExecutionResult.Trade>();
+    var changed = new ArrayList<ExecutionEnvelope.OrderChange>();
+    while (taker.remaining().signum() > 0 && !opposing.isEmpty()) {
+      Order maker = opposing.first();
+      if (taker.direction() == Direction.BUY
+          ? taker.price().compareTo(maker.price()) < 0
+          : taker.price().compareTo(maker.price()) > 0) break;
+      BigDecimal quantity = taker.remaining().min(maker.remaining());
+      Order buyer = taker.direction() == Direction.BUY ? taker : maker;
+      Order seller = taker.direction() == Direction.SELL ? taker : maker;
+      clearing.clearMatchResult(next, buyer, seller, maker.price(), quantity);
+      maker.remaining(number(maker.remaining().subtract(quantity)));
+      maker.updated(event.createdAt());
+      taker.remaining(number(taker.remaining().subtract(quantity)));
+      market.price(maker.price());
+      trades.add(
+          new ExecutionResult.Trade(
+              taker.security(),
+              event.sequenceId(),
+              maker.id(),
+              taker.id(),
+              buyer.user(),
+              seller.user(),
+              maker.price(),
+              quantity,
+              maker.remaining(),
+              taker.remaining()));
+      changed.add(
+          OrderService.change(
+              maker, maker.remaining().signum() == 0 ? "FULLY_FILLED" : "PARTIAL_FILLED"));
+      if (maker.remaining().signum() == 0) next.remove(maker);
     }
-
-    /**
-     * @param takerOrder  输入订单
-     * @param makerBook   尝试匹配成交的OrderBook
-     * @param anotherBook 未能完全成交后挂单的OrderBook
-     * @return 成交结果
-     */
-    private MatchResult processOrder(long sequenceId, OrderEntity takerOrder, OrderBook makerBook,
-            OrderBook anotherBook) {
-        this.sequenceId = sequenceId;
-        long ts = takerOrder.createdAt;
-        MatchResult matchResult = new MatchResult(takerOrder);
-        BigDecimal takerUnfilledQuantity = takerOrder.quantity;
-        for (;;) {
-            OrderEntity makerOrder = makerBook.getFirst();
-            if (makerOrder == null) {
-                // 对手盘不存在:
-                break;
-            }
-            if (takerOrder.direction == Direction.BUY && takerOrder.price.compareTo(makerOrder.price) < 0) {
-                // 买入订单价格比卖盘第一档价格低:
-                break;
-            } else if (takerOrder.direction == Direction.SELL && takerOrder.price.compareTo(makerOrder.price) > 0) {
-                // 卖出订单价格比买盘第一档价格高:
-                break;
-            }
-            // 以Maker价格成交:
-            this.marketPrice = makerOrder.price;
-            // 待成交数量为两者较小值:
-            BigDecimal matchedQuantity = takerUnfilledQuantity.min(makerOrder.unfilledQuantity);
-            // 成交记录:
-            matchResult.add(makerOrder.price, matchedQuantity, makerOrder);
-            // 更新成交后的订单数量:
-            takerUnfilledQuantity = takerUnfilledQuantity.subtract(matchedQuantity);
-            BigDecimal makerUnfilledQuantity = makerOrder.unfilledQuantity.subtract(matchedQuantity);
-            // 对手盘完全成交后，从订单簿中删除:
-            if (makerUnfilledQuantity.signum() == 0) {
-                makerOrder.updateOrder(makerUnfilledQuantity, OrderStatus.FULLY_FILLED, ts);
-                makerBook.remove(makerOrder);
-            } else {
-                // 对手盘部分成交:
-                makerOrder.updateOrder(makerUnfilledQuantity, OrderStatus.PARTIAL_FILLED, ts);
-            }
-            // Taker订单完全成交后，退出循环:
-            if (takerUnfilledQuantity.signum() == 0) {
-                takerOrder.updateOrder(takerUnfilledQuantity, OrderStatus.FULLY_FILLED, ts);
-                break;
-            }
-        }
-        // Taker订单未完全成交时，放入订单簿:
-        if (takerUnfilledQuantity.signum() > 0) {
-            takerOrder.updateOrder(takerUnfilledQuantity,
-                    takerUnfilledQuantity.compareTo(takerOrder.quantity) == 0 ? OrderStatus.PENDING
-                            : OrderStatus.PARTIAL_FILLED,
-                    ts);
-            anotherBook.add(takerOrder);
-        }
-        return matchResult;
-    }
-
-    public void cancel(long ts, OrderEntity order) {
-        OrderBook book = order.direction == Direction.BUY ? this.buyBook : this.sellBook;
-        if (!book.remove(order)) {
-            throw new IllegalArgumentException("Order not found in order book.");
-        }
-        OrderStatus status = order.unfilledQuantity.compareTo(order.quantity) == 0 ? OrderStatus.FULLY_CANCELLED
-                : OrderStatus.PARTIAL_CANCELLED;
-        order.updateOrder(order.unfilledQuantity, status, ts);
-    }
-
-    public OrderBookBean getOrderBook(int maxDepth) {
-        return new OrderBookBean(this.sequenceId, this.marketPrice, this.buyBook.getOrderBook(maxDepth),
-                this.sellBook.getOrderBook(maxDepth));
-    }
-
-    public void debug() {
-        System.out.println("---------- match engine ----------");
-        System.out.println(this.sellBook);
-        System.out.println("  ----------");
-        System.out.println("  " + this.marketPrice);
-        System.out.println("  ----------");
-        System.out.println(this.buyBook);
-        System.out.println("---------- // match engine ----------");
-    }
+    if (taker.remaining().signum() > 0) next.add(taker);
+    market.sequence(event.sequenceId());
+    changed.add(
+        OrderService.change(
+            taker,
+            taker.remaining().signum() == 0
+                ? "FULLY_FILLED"
+                : taker.remaining().compareTo(taker.quantity()) == 0
+                    ? "PENDING"
+                    : "PARTIAL_FILLED"));
+    return new ExecutionResult(event.sequenceId(), true, "OK", taker.id(), trades, changed);
+  }
 }

@@ -1,84 +1,49 @@
-/* 引擎 HTTP 代理：统一观测所有显式就绪检查，保留不可达和恢复中的 503 语义。 */
+/* 引擎只读代理：固定内部上游，保持原超时、精确金额解析和不可用状态映射。 */
 package com.itranswarp.exchange.service;
 
-import java.io.IOException;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
+import com.fasterxml.jackson.databind.*;
+import java.net.URI;
+import java.net.http.*;
+import java.time.Duration;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.server.ResponseStatusException;
 
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Component;
+public final class TradingEngineApiProxyService {
+  private final String engine;
+  private final HttpClient http =
+      HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
+  private final ObjectMapper json =
+      new ObjectMapper().enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
 
-import com.itranswarp.exchange.ApiError;
-import com.itranswarp.exchange.ApiException;
-import com.itranswarp.exchange.util.JsonUtil;
-import com.itranswarp.exchange.support.LoggerSupport;
-import okhttp3.ConnectionPool;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
-import okhttp3.ResponseBody;
+  /** 保存内部只读地址，不接受浏览器提供上游 URL。 */
+  public TradingEngineApiProxyService(String engine) {
+    this.engine = engine;
+  }
 
-/**
- * Proxy to access trading engine.
- */
-@Component
-public class TradingEngineApiProxyService extends LoggerSupport {
-
-    @org.springframework.beans.factory.annotation.Autowired
-    private com.itranswarp.exchange.monitoring.PipelineMonitoring monitoring = new com.itranswarp.exchange.monitoring.PipelineMonitoring();
-
-    @Value("#{exchangeConfiguration.apiEndpoints.tradingEngineApi}")
-    private String tradingEngineInternalApiEndpoint;
-
-    private OkHttpClient okhttpClient = new OkHttpClient.Builder()
-            // set connect timeout:
-            .connectTimeout(1, TimeUnit.SECONDS)
-            // set read timeout:
-            .readTimeout(1, TimeUnit.SECONDS)
-            // set connection pool:
-            .connectionPool(new ConnectionPool(20, 60, TimeUnit.SECONDS))
-            // do not retry:
-            .retryOnConnectionFailure(false).build();
-
-    /** 统一观测控制器及发送入口的就绪检查，不改变超时、重试或 503 语义。 */
-    public void requireReady() {
-        long started = System.nanoTime();
-        try {
-            Map<?, ?> status = JsonUtil.readJson(get("/internal/status"), Map.class);
-            if (!Boolean.TRUE.equals(status.get("ready"))) {
-                throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎尚未就绪");
-            }
-            monitoring.count("engine_gate", "success");
-        } catch (IOException | RuntimeException e) {
-            monitoring.count("engine_gate", "failure");
-            throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎未就绪或探针失败，请稍后重试");
-        } finally {
-            monitoring.duration("engine_gate", started);
-        }
+  /** 只读请求保留原超时和 503 映射，恢复中不返回伪空账户。 */
+  public JsonNode internal(String path) {
+    try {
+      var response =
+          http.send(
+              HttpRequest.newBuilder(URI.create(engine + "/internal/securities" + path))
+                  .timeout(Duration.ofSeconds(3))
+                  .GET()
+                  .build(),
+              HttpResponse.BodyHandlers.ofString());
+      if (response.statusCode() != 200) throw new IllegalStateException();
+      return json.readTree(response.body());
+    } catch (Exception unavailable) {
+      throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "证券引擎未就绪");
     }
+  }
 
-    /** 转发查询；引擎 503 或连接失败均明确不可用，其余非成功状态保持原业务错误处理。 */
-    public String get(String url) throws IOException {
-        Request request = new Request.Builder().url(tradingEngineInternalApiEndpoint + url).header("Accept", "*/*")
-                .build();
-        try (Response response = okhttpClient.newCall(request).execute()) {
-            if (response.code() == 503) {
-                throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎尚未就绪，请稍后重试");
-            }
-            if (response.code() != 200) {
-                logger.error("Internal api failed with code {}: {}", Integer.valueOf(response.code()), url);
-                throw new ApiException(ApiError.OPERATION_TIMEOUT, null, "operation timeout.");
-            }
-            try (ResponseBody body = response.body()) {
-                String json = body.string();
-                if (json == null || json.isEmpty()) {
-                    logger.error("Internal api failed with code 200 but empty response: {}", json);
-                    throw new ApiException(ApiError.INTERNAL_SERVER_ERROR, null, "response is empty.");
-                }
-                return json;
-            }
-        } catch (IOException e) {
-            throw new ApiException(ApiError.ENGINE_UNAVAILABLE, null, "交易引擎不可达，请稍后重试");
-        }
+  /** 健康依赖引擎业务就绪，而非 HTTP 端口存活。 */
+  public boolean ready() {
+    try {
+      internal("/status");
+      return true;
+    } catch (RuntimeException unavailable) {
+      return false;
     }
+  }
 }

@@ -1,901 +1,184 @@
-/*
- * 交易引擎协调资产、订单、撮合与清算；历史重放复用状态逻辑，但隔离所有对外输出。
- * 启动恢复校验通过后才创建消费者和输出线程；快照在完整事件边界复制，不包含对外输出队列。
- */
+/* 证券恢复和实时追赶：数据库事件为完整来源；恢复失败不开放查询，快照不依赖正常停机。 */
 package com.itranswarp.exchange;
 
-import java.math.BigDecimal;
-import java.time.Instant;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.Comparator;
-import jakarta.annotation.PreDestroy;
-import jakarta.annotation.PostConstruct;
+import com.itranswarp.exchange.core.SecuritiesEngine;
+import com.itranswarp.exchange.core.SecuritiesSnapshot;
+import com.itranswarp.exchange.securities.SecurityCatalog;
+import com.itranswarp.exchange.securities.persistence.EventJournal;
+import com.itranswarp.exchange.securities.persistence.ProcessLease;
+import com.itranswarp.exchange.snapshot.SnapshotRepository;
+import java.util.concurrent.*;
+import javax.sql.DataSource;
 
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Component;
+public final class TradingEngineService implements AutoCloseable {
+  public enum Status {
+    RECOVERING,
+    READY,
+    FAILED,
+    STOPPED
+  }
 
-import com.itranswarp.exchange.assets.AssetService;
-import com.itranswarp.exchange.assets.Asset;
-import com.itranswarp.exchange.assets.Transfer;
-import com.itranswarp.exchange.bean.OrderBookBean;
-import com.itranswarp.exchange.clearing.ClearingService;
-import com.itranswarp.exchange.enums.AssetEnum;
-import com.itranswarp.exchange.enums.Direction;
-import com.itranswarp.exchange.enums.MatchType;
-import com.itranswarp.exchange.enums.UserType;
-import com.itranswarp.exchange.match.MatchDetailRecord;
-import com.itranswarp.exchange.match.MatchEngine;
-import com.itranswarp.exchange.match.MatchResult;
-import com.itranswarp.exchange.message.ApiResultMessage;
-import com.itranswarp.exchange.message.NotificationMessage;
-import com.itranswarp.exchange.message.TickMessage;
-import com.itranswarp.exchange.message.event.AbstractEvent;
-import com.itranswarp.exchange.message.event.OrderCancelEvent;
-import com.itranswarp.exchange.message.event.OrderRequestEvent;
-import com.itranswarp.exchange.message.event.TransferEvent;
-import com.itranswarp.exchange.messaging.MessageConsumer;
-import com.itranswarp.exchange.messaging.MessageProducer;
-import com.itranswarp.exchange.messaging.Messaging;
-import com.itranswarp.exchange.messaging.Messaging.Topic;
-import com.itranswarp.exchange.messaging.MessagingFactory;
-import com.itranswarp.exchange.model.quotation.TickEntity;
-import com.itranswarp.exchange.model.trade.MatchDetailEntity;
-import com.itranswarp.exchange.model.trade.OrderEntity;
-import com.itranswarp.exchange.order.OrderService;
-import com.itranswarp.exchange.redis.RedisCache;
-import com.itranswarp.exchange.redis.RedisService;
-import com.itranswarp.exchange.store.StoreService;
-import com.itranswarp.exchange.snapshot.EngineSnapshot;
-import com.itranswarp.exchange.monitoring.EngineMonitoringService;
-import com.itranswarp.exchange.monitoring.EngineMonitoringService.Output;
-import com.itranswarp.exchange.monitoring.PendingQueue;
-import com.itranswarp.exchange.support.LoggerSupport;
-import com.itranswarp.exchange.util.IpUtil;
-import com.itranswarp.exchange.util.JsonUtil;
+  private final EventJournal journal;
+  private final SnapshotRepository snapshots;
+  private final DataSource source;
+  private final com.itranswarp.exchange.securities.output.OutputStore outputs;
+  private long recoveryUpper;
+  private final long intervalMillis;
+  private final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(getClass());
+  private volatile Status status = Status.RECOVERING;
+  private volatile SecuritiesEngine engine;
+  private ProcessLease lease;
+  private ScheduledExecutorService worker;
+  private long savedSequence = -1, lastSnapshotTime;
+  private volatile long target;
 
-@Component
-public class TradingEngineService extends LoggerSupport {
+  /** 仅装配依赖；不在构造器开放消费者或读取半初始化状态。 */
+  public TradingEngineService(DataSource source, SecurityCatalog catalog, long intervalMillis) {
+    if (intervalMillis < 1) throw new IllegalArgumentException("快照周期必须为正数");
+    this.source = source;
+    this.intervalMillis = intervalMillis;
+    this.journal = new EventJournal(source, catalog);
+    this.snapshots = new SnapshotRepository(source, catalog);
+    this.outputs = new com.itranswarp.exchange.securities.output.OutputStore(source);
+  }
 
-    @Autowired
-    EngineMonitoringService monitoring = new EngineMonitoringService();
-
-    /** Spring 注入注册表后绑定常数时间队列指标；不启动任何业务线程或网络请求。 */
-    @PostConstruct
-    public void bindMonitoring() {
-        monitoring.bindQueue("orders", orderQueue);
-        monitoring.bindQueue("matches", matchQueue);
-        monitoring.bindQueue("ticks", tickQueue);
-        monitoring.bindQueue("api_results", apiResultQueue);
-        monitoring.bindQueue("notifications", notificationQueue);
+  /** 取得实例锁、恢复固定上界、保存启动快照后才标为 READY；失败对外保持不可用。 */
+  public synchronized void start() {
+    if (worker != null || status != Status.RECOVERING)
+      throw new IllegalStateException("证券引擎不能重复启动");
+    try {
+      lease = new ProcessLease(source, "engine");
+      target = journal.latest();
+      recoveryUpper = target;
+      if (outputs.position() > target) throw new IllegalStateException("持久输出领先于事件历史");
+      engine = snapshots.restore(Math.min(target, outputs.position()));
+      catchUp(target, SecuritiesEngine.Mode.REPLAY);
+      save();
+      // 恢复期间提交的新事件也从持久日志追赶；不依赖 Kafka 通知刚好到达。
+      target = journal.latest();
+      catchUp(target, SecuritiesEngine.Mode.REPLAY);
+      if (engine.sequence() != savedSequence) save();
+      worker =
+          Executors.newSingleThreadScheduledExecutor(
+              task -> {
+                var thread = new Thread(task, "securities-engine-tail");
+                thread.setDaemon(true);
+                return thread;
+              });
+      status = Status.READY;
+      worker.scheduleWithFixedDelay(this::poll, 200, 200, TimeUnit.MILLISECONDS);
+    } catch (RuntimeException | Error failure) {
+      status = Status.FAILED;
+      if (lease != null) lease.close();
+      throw failure;
     }
+  }
 
-    /** 为恢复和快照协调器共享同一监控状态；返回不需要取得引擎锁。 */
-    public EngineMonitoringService getMonitoring() { return monitoring; }
-
-    @Autowired(required = false)
-    ZoneId zoneId = ZoneId.systemDefault();
-
-    @Value("#{exchangeConfiguration.orderBookDepth}")
-    int orderBookDepth = 100;
-
-    @Value("#{exchangeConfiguration.debugMode}")
-    boolean debugMode = false;
-
-    volatile boolean fatalError = false;
-
-    /** volatile 保证 HTTP 线程能看到恢复进度，不用等待耗时的恢复锁。 */
-    private volatile RecoveryState recoveryState = RecoveryState.RECOVERING;
-
-    private boolean recoveryStarted;
-
-    /** 就绪描述的是恢复已完成且实时入口已启动，不替代 Kafka 或 Redis 持续健康监测。 */
-    public enum RecoveryState { RECOVERING, READY, FAILED, STOPPED }
-
-    @Autowired
-    AssetService assetService;
-
-    @Autowired
-    OrderService orderService;
-
-    @Autowired
-    MatchEngine matchEngine;
-
-    @Autowired
-    ClearingService clearingService;
-
-    @Autowired
-    MessagingFactory messagingFactory;
-
-    @Autowired
-    StoreService storeService;
-
-    @Autowired
-    RedisService redisService;
-
-    private MessageConsumer consumer;
-
-    private MessageProducer<TickMessage> producer;
-
-    private long lastSequenceId = 0;
-
-    private boolean orderBookChanged = false;
-
-    private String shaUpdateOrderBookLua;
-
-    private Thread tickThread;
-    private Thread notifyThread;
-    private Thread apiResultThread;
-    private Thread orderBookThread;
-    private Thread dbThread;
-
-    private volatile OrderBookBean latestOrderBook = null;
-    private Queue<List<OrderEntity>> orderQueue = new PendingQueue<>();
-    private Queue<List<MatchDetailEntity>> matchQueue = new PendingQueue<>();
-    private Queue<TickMessage> tickQueue = new PendingQueue<>();
-    private Queue<ApiResultMessage> apiResultQueue = new PendingQueue<>();
-    private Queue<NotificationMessage> notificationQueue = new PendingQueue<>();
-
-    /** 只允许新引擎开始一次恢复，不允许在线清空或覆盖已经处理的状态。 */
-    public synchronized void beginRecovery() {
-        if (recoveryState != RecoveryState.RECOVERING || recoveryStarted || fatalError || lastSequenceId != 0) {
-            throw new IllegalStateException("引擎不是可恢复的新状态");
-        }
-        this.recoveryStarted = true;
-        monitoring.state("RECOVERING");
+  /** 数据库定时追赶也是 Kafka 丢通知时的兜底；只由一个执行通道推进状态。 */
+  public synchronized void poll() {
+    if (status != Status.READY) return;
+    try {
+      lease.check();
+      target = journal.latest();
+      catchUp(target, SecuritiesEngine.Mode.LIVE);
+    } catch (RuntimeException | Error failure) {
+      status = Status.FAILED;
+      logger.error("证券事件追赶失败，禁止继续服务", failure);
+      return;
     }
-
-    /** 恢复后发布一次当前盘口，再启动实时消费；任意初始化失败由恢复协调器清理。 */
-    public synchronized void startAfterRecovery() {
-        if (recoveryState != RecoveryState.RECOVERING || !recoveryStarted || fatalError) {
-            throw new IllegalStateException("不能开放未成功恢复的引擎");
-        }
-        this.shaUpdateOrderBookLua = this.redisService.loadScriptFromClassPath("/redis/update-orderbook.lua");
-        OrderBookBean book = currentOrderBook();
-        Boolean published = this.redisService.executeScriptReturnBoolean(this.shaUpdateOrderBookLua,
-                new String[] { RedisCache.Key.ORDER_BOOK },
-                new String[] { String.valueOf(book.sequenceId), JsonUtil.writeJson(book), "restore" });
-        if (!Boolean.TRUE.equals(published)) {
-            throw new IllegalStateException("Redis 盘口位置领先于恢复位置，拒绝开放可能过期的引擎");
-        }
-        this.producer = this.messagingFactory.createMessageProducer(Topic.TICK, TickMessage.class);
-        this.tickThread = newOutputThread(Output.TICK, this::runTickThread, "async-tick");
-        this.tickThread.start();
-        this.notifyThread = newOutputThread(Output.NOTIFY, this::runNotifyThread, "async-notify");
-        this.notifyThread.start();
-        this.orderBookThread = newOutputThread(Output.ORDERBOOK, this::runOrderBookThread, "async-orderbook");
-        this.orderBookThread.start();
-        this.apiResultThread = newOutputThread(Output.API_RESULT, this::runApiResultThread, "async-api-result");
-        this.apiResultThread.start();
-        this.dbThread = newOutputThread(Output.DB, this::runDbThread, "async-db");
-        this.dbThread.start();
-        // earliest 只用于没有有效消费位置时；启动窗口内的新事件不能从 latest 开始而被跳过。
-        this.consumer = this.messagingFactory.createBatchMessageListener(Messaging.Topic.TRADE, IpUtil.getHostId(),
-                this::onTradeMessages, null, "earliest");
-        this.recoveryState = RecoveryState.READY;
-        monitoring.expectWorkers(true);
-        monitoring.state("READY");
+    if (System.currentTimeMillis() - lastSnapshotTime >= intervalMillis
+        && engine.sequence() != savedSequence) {
+      try {
+        save();
+      } catch (RuntimeException failure) {
+        logger.error("周期快照失败，保留历史并下轮重试", failure);
+      }
     }
+  }
 
-    /** 包装输出线程以观察异常退出，保留原异常和退出行为，不添加自动重试。 */
-    private Thread newOutputThread(Output output, Runnable action, String name) {
-        // 回调只捕获未处理故障；正常中断或停机不增加失败计数。
-        Thread thread = new Thread(() -> {
-            try {
-                action.run();
-            } catch (RuntimeException | Error e) {
-                if (recoveryState != RecoveryState.STOPPED) monitoring.outputFailed(output);
-                throw e;
-            }
-        }, name);
-        monitoring.bindWorker(output, thread);
-        return thread;
+  /** 只在完整事件边界执行；缺口、停滞、超出固定上界都中止恢复。 */
+  private void catchUp(long upper, SecuritiesEngine.Mode mode) {
+    while (engine.sequence() < upper) {
+      lease.check();
+      long previous = engine.sequence();
+      var page = journal.page(previous, upper, 1000);
+      if (page.isEmpty()) throw new IllegalStateException("已提交事件历史缺失");
+      for (var event : page) {
+        var prepared = engine.prepare(event);
+        outputs.save(
+            event,
+            prepared.output(),
+            mode == SecuritiesEngine.Mode.REPLAY || event.sequenceId() <= recoveryUpper);
+        engine.install(prepared);
+      }
+      if (engine.sequence() <= previous || engine.sequence() > upper)
+        throw new IllegalStateException("事件分页未正确推进");
     }
+  }
 
-    /** 查询可见的生命周期状态；致命错误即使尚未清理线程也不得报告就绪。 */
-    public RecoveryState getRecoveryState() {
-        return fatalError ? RecoveryState.FAILED : recoveryState;
-    }
+  /** 捕获完整状态后编码/写库；核心执行锁不跨 JDBC I/O，成功后才记录保存位置。 */
+  public synchronized void save() {
+    if (status == Status.FAILED || status == Status.STOPPED)
+      throw new IllegalStateException("当前状态禁止保存快照");
+    if (engine == null || lease == null) throw new IllegalStateException("证券引擎尚未初始化");
+    lease.check();
+    var value = engine.snapshot();
+    snapshots.save(value);
+    savedSequence = value.sequenceId();
+    lastSnapshotTime = System.currentTimeMillis();
+  }
 
-    /** 业务入口快速拒绝恢复中、失败或停止状态，不返回半恢复的空资产。 */
-    public void requireReady() {
-        RecoveryState state = getRecoveryState();
-        if (state != RecoveryState.READY) {
-            throw new ApiException(ApiError.ENGINE_UNAVAILABLE, state.name(), "交易引擎尚未就绪，请稍后重试");
-        }
-    }
+  /** 只有 READY 才返回状态副本；恢复中的查询不能表现为正常空资产。 */
+  public SecuritiesSnapshot state() {
+    requireReady();
+    var value = engine.snapshot();
+    requireReady();
+    return value;
+  }
 
-    /** 恢复失败后关闭已创建的资源；不回滚已应用的内存事件，必须重建引擎再恢复。 */
-    public void failRecovery() {
-        this.fatalError = true;
-        this.recoveryState = RecoveryState.FAILED;
-        monitoring.state("FAILED");
-        monitoring.expectWorkers(false);
-        stopResources();
-    }
+  /** 返回指定用户只读账户，内部负债账户不能作为普通用户查询。 */
+  public SecuritiesEngine.Account account(long user) {
+    requireReady();
+    if (user <= 1) throw new IllegalArgumentException("普通用户标识无效");
+    var value = engine.account(user);
+    requireReady();
+    return value;
+  }
 
-    /** 关闭业务入口和所有输出线程，兼容恢复尚未创建消费者时的清理。 */
-    @PreDestroy
-    public void destroy() {
-        this.recoveryState = RecoveryState.STOPPED;
-        monitoring.state("STOPPED");
-        monitoring.expectWorkers(false);
-        stopResources();
-    }
+  /** 就绪是显式生命周期，不等同于 JVM 已启动。 */
+  public Status status() {
+    return status;
+  }
 
-    /** 逐个清理已创建的资源，避免某个资源关闭失败阻止其余线程收到退出信号。 */
-    private void stopResources() {
-        if (this.consumer != null) {
-            try {
-                this.consumer.stop();
-            } catch (Exception e) {
-                logger.warn("停止交易消费者失败", e);
-            }
-        }
-        for (Thread thread : new Thread[] { tickThread, notifyThread, apiResultThread, orderBookThread, dbThread }) {
-            if (thread != null) {
-                thread.interrupt();
-            }
-        }
-    }
+  /** 公开盘口只含价量，历史/缓存不可用时可以回源本方法。 */
+  public com.itranswarp.exchange.securities.output.ExecutionEnvelope.Book book(long security) {
+    requireReady();
+    var value = engine.book(security);
+    requireReady();
+    return value;
+  }
 
-    /** 盘口发布位置使用引擎已应用序号，使撤单也能推进 Redis 版本而不是沿用最后下单序号。 */
-    private OrderBookBean currentOrderBook() {
-        OrderBookBean book = this.matchEngine.getOrderBook(this.orderBookDepth);
-        book.sequenceId = this.lastSequenceId;
-        return book;
-    }
+  /** 监控恢复与追赶目标，不把落库上界解释为已执行位置。 */
+  public long target() {
+    return target;
+  }
 
-    /** 从实时队列发送 Tick 并统计调用正常返回；不等待 broker 确认，不负责历史补偿。 */
-    private void runTickThread() {
-        logger.info("start tick thread...");
-        while (!Thread.currentThread().isInterrupted()) {
-            List<TickMessage> msgs = new ArrayList<>();
-            for (;;) {
-                TickMessage msg = tickQueue.poll();
-                if (msg != null) {
-                    msgs.add(msg);
-                    if (msgs.size() >= 1000) {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-            if (!msgs.isEmpty()) {
-                if (logger.isDebugEnabled()) {
-                    logger.debug("send {} tick messages...", msgs.size());
-                }
-                this.producer.sendMessages(msgs);
-                monitoring.tickSendReturned();
-            } else {
-                // 无TickMessage时，暂停1ms:
-                try {
-                    Thread.sleep(1);
-                } catch (InterruptedException e) {
-                    logger.warn("{} was interrupted.", Thread.currentThread().getName());
-                    break;
-                }
-            }
-        }
-    }
+  /** 查询已应用进度，不泄露恢复中的账户对象。 */
+  public long applied() {
+    var current = engine;
+    return current == null ? 0 : current.sequence();
+  }
 
-    /** 发布实时私人通知，恢复期间不会生成这些任务。 */
-    private void runNotifyThread() {
-        logger.info("start publish notify to redis...");
-        while (!Thread.currentThread().isInterrupted()) {
-            NotificationMessage msg = this.notificationQueue.poll();
-            if (msg != null) {
-                redisService.publish(RedisCache.Topic.NOTIFICATION, JsonUtil.writeJson(msg));
-            } else {
-                // 无推送时，暂停1ms:
-                try {
-                    Thread.sleep(1);
-                } catch (InterruptedException e) {
-                    logger.warn("{} was interrupted.", Thread.currentThread().getName());
-                    break;
-                }
-            }
-        }
-    }
+  /** 未就绪统一拒绝，HTTP 层映射成 503。 */
+  private void requireReady() {
+    if (status != Status.READY) throw new IllegalStateException("证券引擎未就绪: " + status);
+  }
 
-    /** 发布实时异步请求结果，线程关闭时不再接收新输出。 */
-    private void runApiResultThread() {
-        logger.info("start publish api result to redis...");
-        while (!Thread.currentThread().isInterrupted()) {
-            ApiResultMessage result = this.apiResultQueue.poll();
-            if (result != null) {
-                redisService.publish(RedisCache.Topic.TRADING_API_RESULT, JsonUtil.writeJson(result));
-            } else {
-                // 无推送时，暂停1ms:
-                try {
-                    Thread.sleep(1);
-                } catch (InterruptedException e) {
-                    logger.warn("{} was interrupted.", Thread.currentThread().getName());
-                    break;
-                }
-            }
-        }
-    }
-
-    /** 发布已完成事件边界上的最新盘口；以 volatile 引用保证跨线程可见性。 */
-    private void runOrderBookThread() {
-        logger.info("start update orderbook snapshot to redis...");
-        long lastSequenceId = 0;
-        while (!Thread.currentThread().isInterrupted()) {
-            // 获取OrderBookBean的引用，确保后续操作针对局部变量而非成员变量:
-            final OrderBookBean orderBook = this.latestOrderBook;
-            // 仅在OrderBookBean更新后刷新Redis:
-            if (orderBook != null && orderBook.sequenceId > lastSequenceId) {
-                if (logger.isDebugEnabled()) {
-                    logger.debug("update orderbook snapshot at sequence id {}...", orderBook.sequenceId);
-                }
-                redisService.executeScriptReturnBoolean(this.shaUpdateOrderBookLua,
-                        // keys: [cache-key]
-                        new String[] { RedisCache.Key.ORDER_BOOK },
-                        // args: [sequenceId, json-data]
-                        new String[] { String.valueOf(orderBook.sequenceId), JsonUtil.writeJson(orderBook) });
-                lastSequenceId = orderBook.sequenceId;
-            } else {
-                // 无更新时，暂停1ms:
-                try {
-                    Thread.sleep(1);
-                } catch (InterruptedException e) {
-                    logger.warn("{} was interrupted.", Thread.currentThread().getName());
-                    break;
-                }
-            }
-        }
-    }
-
-    /** 消费实时历史投影任务；关闭时退出，持久化输出可靠性不在本阶段补偿。 */
-    private void runDbThread() {
-        logger.info("start batch insert to db...");
-        while (!Thread.currentThread().isInterrupted()) {
-            try {
-                saveToDb();
-            } catch (InterruptedException e) {
-                logger.warn("{} was interrupted.", Thread.currentThread().getName());
-                break;
-            }
-        }
-    }
-
-    // called by dbExecutor thread only:
-    private void saveToDb() throws InterruptedException {
-        if (!matchQueue.isEmpty()) {
-            List<MatchDetailEntity> batch = new ArrayList<>(1000);
-            for (;;) {
-                List<MatchDetailEntity> matches = matchQueue.poll();
-                if (matches != null) {
-                    batch.addAll(matches);
-                    if (batch.size() >= 1000) {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-            batch.sort(MatchDetailEntity::compareTo);
-            if (logger.isDebugEnabled()) {
-                logger.debug("batch insert {} match details...", batch.size());
-            }
-            this.storeService.insertIgnore(batch);
-        }
-        if (!orderQueue.isEmpty()) {
-            List<OrderEntity> batch = new ArrayList<>(1000);
-            for (;;) {
-                List<OrderEntity> orders = orderQueue.poll();
-                if (orders != null) {
-                    batch.addAll(orders);
-                    if (batch.size() >= 1000) {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-            batch.sort(OrderEntity::compareTo);
-            if (logger.isDebugEnabled()) {
-                logger.debug("batch insert {} orders...", batch.size());
-            }
-            this.storeService.insertIgnore(batch);
-        }
-        if (matchQueue.isEmpty()) {
-            Thread.sleep(1);
-        }
-    }
-
-    /** Kafka 回调在初始化锁释放后检查就绪，再接入实时处理，禁止恢复期间修改状态。 */
-    private synchronized void onTradeMessages(List<AbstractEvent> messages) {
-        requireReady();
-        processMessages(messages);
-    }
-
-    /** 串行执行实时批次，并仅为实时事件生成供 Redis 输出线程使用的盘口快照。 */
-    public synchronized void processMessages(List<AbstractEvent> messages) {
-        this.orderBookChanged = false;
-        for (AbstractEvent message : messages) {
-            processEvent(message);
-        }
-        if (this.orderBookChanged) {
-            // 获取最新的OrderBook快照:
-            this.latestOrderBook = currentOrderBook();
-        }
-    }
-
-    /** 执行一个实时事件，保留现有缺口补读和异步输出行为。 */
-    public synchronized void processEvent(AbstractEvent event) {
-        executeEvent(event, EventExecutionMode.LIVE);
-    }
-
-    /**
-     * 按输入顺序重放已定序的历史事件，仅重建状态和已应用序号。
-     * 不访问数据库补读，不生成旧通知、行情、HTTP 结果或历史写入任务。
-     * 与实时入口使用同一锁；断链或执行失败会标记引擎失败并抛异常，调用者不得继续开放服务。
-     * 此方法不清空既有状态，也不保证整批回滚，应由后续恢复协调器在新状态上调用。
-     */
-    public synchronized void replayEvents(List<AbstractEvent> events) {
-        if (this.fatalError) {
-            throw new IllegalStateException("交易引擎已失败，不能继续重放");
-        }
-        for (AbstractEvent event : events) {
-            executeEvent(event, EventExecutionMode.REPLAY);
-        }
-    }
-
-    /** 返回已完整执行的事件序号；该值不是 Kafka 消费位置或数据库最大序号。 */
-    public synchronized long getLastSequenceId() {
-        return this.lastSequenceId;
-    }
-
-    /** 返回恢复使用的固定时区；时区影响订单 ID，不能在快照恢复时悄悄更换。 */
-    public String getSnapshotZoneId() {
-        return this.zoneId.getId();
-    }
-
-    /** 在同一事件锁内校验并取得独立不可变状态；调用者在锁外序列化和写数据库。 */
-    public synchronized EngineSnapshot captureSnapshot() {
-        if (fatalError || recoveryState == RecoveryState.FAILED || recoveryState == RecoveryState.STOPPED) {
-            throw new IllegalStateException("不能对失败或停止的引擎生成快照");
-        }
-        validate();
-        List<EngineSnapshot.AssetState> assets = new ArrayList<>();
-        this.assetService.getUserAssets().forEach((user, balances) -> balances.forEach((asset, balance) ->
-                assets.add(new EngineSnapshot.AssetState(user, asset, balance.getAvailable(), balance.getFrozen()))));
-        assets.sort(Comparator.comparingLong(EngineSnapshot.AssetState::userId)
-                .thenComparing(EngineSnapshot.AssetState::asset));
-        List<EngineSnapshot.OrderState> orders = this.orderService.getActiveOrders().values().stream()
-                .sorted(Comparator.comparingLong(order -> order.sequenceId))
-                .map(EngineSnapshot.OrderState::from).toList();
-        EngineSnapshot snapshot = new EngineSnapshot(EngineSnapshot.FORMAT_VERSION, lastSequenceId,
-                zoneId.getId(), matchEngine.marketPrice, assets, orders);
-        snapshot.validateShape();
-        return snapshot;
-    }
-
-    /**
-     * 仅在启动恢复的新状态安装快照。先在独立候选中校验，失败不会污染真实状态。
-     * 安装时保留 Spring 注入的组件对象，避免控制器仍引用旧组件；全局、用户和盘口共享订单。
-     */
-    public synchronized void restoreSnapshot(EngineSnapshot snapshot) {
-        if (!recoveryStarted || recoveryState != RecoveryState.RECOVERING || fatalError || lastSequenceId != 0
-                || !assetService.getUserAssets().isEmpty() || !orderService.getActiveOrders().isEmpty()
-                || !matchEngine.buyBook.book.isEmpty() || !matchEngine.sellBook.book.isEmpty()) {
-            throw new IllegalStateException("快照只能安装到启动恢复的新状态");
-        }
-        snapshot.validateShape();
-        if (!zoneId.getId().equals(snapshot.zoneId())) {
-            throw new IllegalStateException("快照时区与引擎配置不同，禁止改变订单标识语义");
-        }
-        TradingEngineService candidate = new TradingEngineService();
-        candidate.assetService = new AssetService();
-        candidate.orderService = new OrderService(candidate.assetService);
-        candidate.matchEngine = new MatchEngine();
-        for (EngineSnapshot.AssetState asset : snapshot.assets()) {
-            candidate.assetService.getUserAssets().computeIfAbsent(asset.userId(), user -> new ConcurrentHashMap<>())
-                    .put(asset.asset(), new Asset(asset.available(), asset.frozen()));
-        }
-        for (EngineSnapshot.OrderState data : snapshot.orders()) {
-            OrderEntity order = data.toOrder();
-            candidate.orderService.restoreOrder(order);
-            if (!(order.direction == Direction.BUY ? candidate.matchEngine.buyBook : candidate.matchEngine.sellBook)
-                    .add(order)) {
-                throw new IllegalArgumentException("快照订单簿优先级重复");
-            }
-        }
-        candidate.matchEngine.marketPrice = snapshot.marketPrice();
-        try {
-            candidate.validate();
-            OrderEntity buy = candidate.matchEngine.buyBook.getFirst();
-            OrderEntity sell = candidate.matchEngine.sellBook.getFirst();
-            if (buy != null && sell != null && buy.price.compareTo(sell.price) >= 0) {
-                throw new IllegalStateException("快照包含尚未撮合的交叉盘口");
-            }
-        } catch (IllegalStateException e) {
-            throw new IllegalArgumentException("快照业务状态不一致", e);
-        }
-        this.assetService.getUserAssets().putAll(candidate.assetService.getUserAssets());
-        for (OrderEntity order : candidate.orderService.getActiveOrders().values()) {
-            this.orderService.restoreOrder(order);
-        }
-        this.matchEngine.buyBook.book.putAll(candidate.matchEngine.buyBook.book);
-        this.matchEngine.sellBook.book.putAll(candidate.matchEngine.sellBook.book);
-        this.matchEngine.marketPrice = snapshot.marketPrice();
-        this.lastSequenceId = snapshot.sequenceId();
-        monitoring.applied(this.lastSequenceId);
-    }
-
-    /** 统计完整执行、重复和失败；缺口补读仅统计实际执行的子事件，避免重复计数。 */
-    private void executeEvent(AbstractEvent event, EventExecutionMode mode) {
-        if (fatalError) return;
-        long previous = lastSequenceId;
-        boolean gap = mode == EventExecutionMode.LIVE && event.sequenceId > previous && event.previousId > previous;
-        long start = System.nanoTime();
-        boolean failed = false;
-        try {
-            applyEvent(event, mode);
-        } catch (RuntimeException | Error e) {
-            failed = true;
-            monitoring.state("FAILED");
-            throw e;
-        } finally {
-            if (!gap) {
-                String result = failed || fatalError ? "failure" : event.sequenceId <= previous ? "duplicate" : "applied";
-                monitoring.event(mode == EventExecutionMode.LIVE ? "live" : "replay", result, start);
-            }
-        }
-    }
-
-    /** 保留原有顺序检查与状态分发，执行模式只控制输出和重放失败行为。 */
-    private void applyEvent(AbstractEvent event, EventExecutionMode mode) {
-        if (this.fatalError) {
-            return;
-        }
-        if (event.sequenceId <= this.lastSequenceId) {
-            logger.warn("skip duplicate event: {}", event);
-            return;
-        }
-        if (mode == EventExecutionMode.REPLAY && event.previousId != this.lastSequenceId) {
-            this.fatalError = true;
-            throw new IllegalStateException("历史事件断链：期望 previousId=" + this.lastSequenceId
-                    + "，实际 previousId=" + event.previousId);
-        }
-        if (event.previousId > this.lastSequenceId) {
-            logger.warn("event lost: expected previous id {} but actual {} for event {}", this.lastSequenceId,
-                    event.previousId, event);
-            List<AbstractEvent> events = this.storeService.loadEventsFromDb(this.lastSequenceId);
-            if (events.isEmpty()) {
-                logger.error("cannot load lost event from db.");
-                panic();
-                return;
-            }
-            for (AbstractEvent e : events) {
-                executeEvent(e, mode);
-            }
-            return;
-        }
-        if (event.previousId != lastSequenceId) {
-            logger.error("bad event: expected previous id {} but actual {} for event: {}", this.lastSequenceId,
-                    event.previousId, event);
-            panic();
-            return;
-        }
-        if (logger.isDebugEnabled()) {
-            logger.debug("process event {} -> {}: {}...", this.lastSequenceId, event.sequenceId, event);
-        }
-        try {
-            if (event instanceof OrderRequestEvent) {
-                createOrder((OrderRequestEvent) event, mode);
-            } else if (event instanceof OrderCancelEvent) {
-                cancelOrder((OrderCancelEvent) event, mode);
-            } else if (event instanceof TransferEvent) {
-                transfer((TransferEvent) event);
-            } else {
-                if (mode == EventExecutionMode.REPLAY) {
-                    throw new IllegalArgumentException("不支持的历史事件类型：" + event.getClass().getName());
-                }
-                logger.error("unable to process event type: {}", event.getClass().getName());
-                panic();
-                return;
-            }
-            if (debugMode) {
-                this.validate();
-            }
-        } catch (Exception e) {
-            if (mode == EventExecutionMode.REPLAY) {
-                this.fatalError = true;
-                throw new IllegalStateException("历史事件执行失败，sequenceId=" + event.sequenceId, e);
-            }
-            logger.error("process event error.", e);
-            panic();
-            return;
-        }
-        this.lastSequenceId = event.sequenceId;
-        monitoring.applied(this.lastSequenceId);
-        if (logger.isDebugEnabled()) {
-            logger.debug("set last processed sequence id: {}...", this.lastSequenceId);
-        }
-        if (debugMode) {
-            this.debug();
-        }
-    }
-
-    /** 保留实时致命故障退出行为，退出前记录失败状态，监控不修复交易状态。 */
-    private void panic() {
-        logger.error("application panic. exit now...");
-        this.fatalError = true;
-        monitoring.state("FAILED");
-        System.exit(1);
-    }
-
-    boolean transfer(TransferEvent event) {
-        boolean ok = this.assetService.tryTransfer(Transfer.AVAILABLE_TO_AVAILABLE, event.fromUserId, event.toUserId,
-                event.asset, event.amount, event.sufficient);
-        return ok;
-    }
-
-    /** 共用下单、冻结、撮合和清算；重放完成状态变更后立即返回，不创建输出任务。 */
-    private void createOrder(OrderRequestEvent event, EventExecutionMode mode) {
-        ZonedDateTime zdt = Instant.ofEpochMilli(event.createdAt).atZone(zoneId);
-        int year = zdt.getYear();
-        int month = zdt.getMonth().getValue();
-        long orderId = event.sequenceId * 10000 + (year * 100 + month);
-        OrderEntity order = this.orderService.createOrder(event.sequenceId, event.createdAt, orderId, event.userId,
-                event.direction, event.price, event.quantity);
-        if (order == null) {
-            logger.warn("create order failed.");
-            // 推送失败结果:
-            if (mode == EventExecutionMode.LIVE) {
-                this.apiResultQueue.add(ApiResultMessage.createOrderFailed(event.refId, event.createdAt));
-            }
-            return;
-        }
-        MatchResult result = this.matchEngine.processOrder(event.sequenceId, order);
-        this.clearingService.clearMatchResult(result);
-        if (mode == EventExecutionMode.REPLAY) {
-            return;
-        }
-        publishOrderResult(event, order, result);
-    }
-
-    /** 为实时订单收集 HTTP 结果、成交通知、Tick 和历史投影；重放不进入此方法。 */
-    private void publishOrderResult(OrderRequestEvent event, OrderEntity order, MatchResult result) {
-        // 推送成功结果,注意必须复制一份OrderEntity,因为将异步序列化:
-        this.apiResultQueue.add(ApiResultMessage.orderSuccess(event.refId, order.copy(), event.createdAt));
-        this.orderBookChanged = true;
-        // 收集Notification:
-        List<NotificationMessage> notifications = new ArrayList<>();
-        notifications.add(createNotification(event.createdAt, "order_matched", order.userId, order.copy()));
-        // 收集已完成的OrderEntity并生成MatchDetailEntity, TickEntity:
-        if (!result.matchDetails.isEmpty()) {
-            List<OrderEntity> closedOrders = new ArrayList<>();
-            List<MatchDetailEntity> matchDetails = new ArrayList<>();
-            List<TickEntity> ticks = new ArrayList<>();
-            if (result.takerOrder.status.isFinalStatus) {
-                closedOrders.add(result.takerOrder);
-            }
-            for (MatchDetailRecord detail : result.matchDetails) {
-                OrderEntity maker = detail.makerOrder();
-                notifications.add(createNotification(event.createdAt, "order_matched", maker.userId, maker.copy()));
-                if (maker.status.isFinalStatus) {
-                    closedOrders.add(maker);
-                }
-                MatchDetailEntity takerDetail = generateMatchDetailEntity(event.sequenceId, event.createdAt, detail,
-                        true);
-                MatchDetailEntity makerDetail = generateMatchDetailEntity(event.sequenceId, event.createdAt, detail,
-                        false);
-                matchDetails.add(takerDetail);
-                matchDetails.add(makerDetail);
-                TickEntity tick = new TickEntity();
-                tick.sequenceId = event.sequenceId;
-                tick.takerOrderId = detail.takerOrder().id;
-                tick.makerOrderId = detail.makerOrder().id;
-                tick.price = detail.price();
-                tick.quantity = detail.quantity();
-                tick.takerDirection = detail.takerOrder().direction == Direction.BUY;
-                tick.createdAt = event.createdAt;
-                ticks.add(tick);
-            }
-            // 异步写入数据库:
-            this.orderQueue.add(closedOrders);
-            this.matchQueue.add(matchDetails);
-            // 异步发送Tick消息:
-            TickMessage msg = new TickMessage();
-            msg.sequenceId = event.sequenceId;
-            msg.createdAt = event.createdAt;
-            msg.ticks = ticks;
-            this.tickQueue.add(msg);
-            // 异步通知OrderMatch:
-            this.notificationQueue.addAll(notifications);
-        }
-    }
-
-    private NotificationMessage createNotification(long ts, String type, Long userId, Object data) {
-        NotificationMessage msg = new NotificationMessage();
-        msg.createdAt = ts;
-        msg.type = type;
-        msg.userId = userId;
-        msg.data = data;
-        return msg;
-    }
-
-    MatchDetailEntity generateMatchDetailEntity(long sequenceId, long timestamp, MatchDetailRecord detail,
-            boolean forTaker) {
-        MatchDetailEntity d = new MatchDetailEntity();
-        d.sequenceId = sequenceId;
-        d.orderId = forTaker ? detail.takerOrder().id : detail.makerOrder().id;
-        d.counterOrderId = forTaker ? detail.makerOrder().id : detail.takerOrder().id;
-        d.direction = forTaker ? detail.takerOrder().direction : detail.makerOrder().direction;
-        d.price = detail.price();
-        d.quantity = detail.quantity();
-        d.type = forTaker ? MatchType.TAKER : MatchType.MAKER;
-        d.userId = forTaker ? detail.takerOrder().userId : detail.makerOrder().userId;
-        d.counterUserId = forTaker ? detail.makerOrder().userId : detail.takerOrder().userId;
-        d.createdAt = timestamp;
-        return d;
-    }
-
-    /** 共用撤单和解冻逻辑；重放不产生成功或失败响应，也不触发盘口发布。 */
-    private void cancelOrder(OrderCancelEvent event, EventExecutionMode mode) {
-        OrderEntity order = this.orderService.getOrder(event.refOrderId);
-        // 未找到活动订单或订单不属于该用户:
-        if (order == null || order.userId.longValue() != event.userId.longValue()) {
-            // 发送失败消息:
-            if (mode == EventExecutionMode.LIVE) {
-                this.apiResultQueue.add(ApiResultMessage.cancelOrderFailed(event.refId, event.createdAt));
-            }
-            return;
-        }
-        this.matchEngine.cancel(event.createdAt, order);
-        this.clearingService.clearCancelOrder(order);
-        if (mode == EventExecutionMode.REPLAY) {
-            return;
-        }
-        this.orderBookChanged = true;
-        // 发送成功消息:
-        this.apiResultQueue.add(ApiResultMessage.orderSuccess(event.refId, order, event.createdAt));
-        this.notificationQueue.add(createNotification(event.createdAt, "order_canceled", order.userId, order));
-    }
-
-    public void debug() {
-        System.out.println("========== trading engine ==========");
-        this.assetService.debug();
-        this.orderService.debug();
-        this.matchEngine.debug();
-        System.out.println("========== // trading engine ==========");
-    }
-
-    void validate() {
-        logger.debug("start validate...");
-        validateAssets();
-        validateOrders();
-        validateMatchEngine();
-        logger.debug("validate ok.");
-    }
-
-    void validateAssets() {
-        // 验证系统资产完整性:
-        BigDecimal totalUSD = BigDecimal.ZERO;
-        BigDecimal totalBTC = BigDecimal.ZERO;
-        for (Entry<Long, ConcurrentMap<AssetEnum, Asset>> userEntry : this.assetService.getUserAssets().entrySet()) {
-            Long userId = userEntry.getKey();
-            ConcurrentMap<AssetEnum, Asset> assets = userEntry.getValue();
-            for (Entry<AssetEnum, Asset> entry : assets.entrySet()) {
-                AssetEnum assetId = entry.getKey();
-                Asset asset = entry.getValue();
-                if (userId.longValue() == UserType.DEBT.getInternalUserId()) {
-                    // 系统负债账户available不允许为正:
-                    require(asset.getAvailable().signum() <= 0, "Debt has positive available: " + asset);
-                    // 系统负债账户frozen必须为0:
-                    require(asset.getFrozen().signum() == 0, "Debt has non-zero frozen: " + asset);
-                } else {
-                    // 交易用户的available/frozen不允许为负数:
-                    require(asset.getAvailable().signum() >= 0, "Trader has negative available: " + asset);
-                    require(asset.getFrozen().signum() >= 0, "Trader has negative frozen: " + asset);
-                }
-                switch (assetId) {
-                case USD -> {
-                    totalUSD = totalUSD.add(asset.getTotal());
-                }
-                case BTC -> {
-                    totalBTC = totalBTC.add(asset.getTotal());
-                }
-                default -> require(false, "Unexpected asset id: " + assetId);
-                }
-            }
-        }
-        // 各类别资产总额为0:
-        require(totalUSD.signum() == 0, "Non zero USD balance: " + totalUSD);
-        require(totalBTC.signum() == 0, "Non zero BTC balance: " + totalBTC);
-    }
-
-    void validateOrders() {
-        // 验证订单:
-        Map<Long, Map<AssetEnum, BigDecimal>> userOrderFrozen = new HashMap<>();
-        for (Entry<Long, OrderEntity> entry : this.orderService.getActiveOrders().entrySet()) {
-            OrderEntity order = entry.getValue();
-            require(order.unfilledQuantity.signum() > 0, "Active order must have positive unfilled amount: " + order);
-            switch (order.direction) {
-            case BUY -> {
-                // 订单必须在MatchEngine中:
-                require(this.matchEngine.buyBook.exist(order), "order not found in buy book: " + order);
-                // 累计冻结的USD:
-                userOrderFrozen.putIfAbsent(order.userId, new HashMap<>());
-                Map<AssetEnum, BigDecimal> frozenAssets = userOrderFrozen.get(order.userId);
-                frozenAssets.putIfAbsent(AssetEnum.USD, BigDecimal.ZERO);
-                BigDecimal frozen = frozenAssets.get(AssetEnum.USD);
-                frozenAssets.put(AssetEnum.USD, frozen.add(order.price.multiply(order.unfilledQuantity)));
-            }
-            case SELL -> {
-                // 订单必须在MatchEngine中:
-                require(this.matchEngine.sellBook.exist(order), "order not found in sell book: " + order);
-                // 累计冻结的BTC:
-                userOrderFrozen.putIfAbsent(order.userId, new HashMap<>());
-                Map<AssetEnum, BigDecimal> frozenAssets = userOrderFrozen.get(order.userId);
-                frozenAssets.putIfAbsent(AssetEnum.BTC, BigDecimal.ZERO);
-                BigDecimal frozen = frozenAssets.get(AssetEnum.BTC);
-                frozenAssets.put(AssetEnum.BTC, frozen.add(order.unfilledQuantity));
-            }
-            default -> require(false, "Unexpected order direction: " + order.direction);
-            }
-        }
-        // 订单冻结的累计金额必须和Asset冻结一致:
-        for (Entry<Long, ConcurrentMap<AssetEnum, Asset>> userEntry : this.assetService.getUserAssets().entrySet()) {
-            Long userId = userEntry.getKey();
-            ConcurrentMap<AssetEnum, Asset> assets = userEntry.getValue();
-            for (Entry<AssetEnum, Asset> entry : assets.entrySet()) {
-                AssetEnum assetId = entry.getKey();
-                Asset asset = entry.getValue();
-                if (asset.getFrozen().signum() > 0) {
-                    Map<AssetEnum, BigDecimal> orderFrozen = userOrderFrozen.get(userId);
-                    require(orderFrozen != null, "No order frozen found for user: " + userId + ", asset: " + asset);
-                    BigDecimal frozen = orderFrozen.get(assetId);
-                    require(frozen != null, "No order frozen found for asset: " + asset);
-                    require(frozen.compareTo(asset.getFrozen()) == 0,
-                            "Order frozen " + frozen + " is not equals to asset frozen: " + asset);
-                    // 从userOrderFrozen中删除已验证的Asset数据:
-                    orderFrozen.remove(assetId);
-                }
-            }
-        }
-        // userOrderFrozen不存在未验证的Asset数据:
-        for (Entry<Long, Map<AssetEnum, BigDecimal>> userEntry : userOrderFrozen.entrySet()) {
-            Long userId = userEntry.getKey();
-            Map<AssetEnum, BigDecimal> frozenAssets = userEntry.getValue();
-            require(frozenAssets.isEmpty(), "User " + userId + " has unexpected frozen for order: " + frozenAssets);
-        }
-    }
-
-    void validateMatchEngine() {
-        // OrderBook的Order必须在ActiveOrders中:
-        Map<Long, OrderEntity> copyOfActiveOrders = new HashMap<>(this.orderService.getActiveOrders());
-        for (OrderEntity order : this.matchEngine.buyBook.book.values()) {
-            require(copyOfActiveOrders.remove(order.id) == order,
-                    "Order in buy book is not in active orders: " + order);
-        }
-        for (OrderEntity order : this.matchEngine.sellBook.book.values()) {
-            require(copyOfActiveOrders.remove(order.id) == order,
-                    "Order in sell book is not in active orders: " + order);
-        }
-        // activeOrders的所有Order必须在Order Book中:
-        require(copyOfActiveOrders.isEmpty(), "Not all active orders are in order book.");
-    }
-
-    /** 校验失败抛出异常，由事件入口决定实时停机或重放失败，不在校验内部退出进程。 */
-    void require(boolean condition, String errorMessage) {
-        if (!condition) {
-            logger.error("validate failed: {}", errorMessage);
-            throw new IllegalStateException("交易状态校验失败：" + errorMessage);
-        }
-    }
+  /** 停止本实例线程并释放锁；不依赖停机保存，也不停止容器或其他应用。 */
+  @Override
+  public synchronized void close() {
+    status = Status.STOPPED;
+    if (worker != null) worker.shutdownNow();
+    if (lease != null) lease.close();
+  }
 }

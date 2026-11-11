@@ -1,0 +1,6 @@
+# 证券 quotation 专属配置；仅非敏感参数通过配置中心分发。
+server:
+  port: ${SECURITIES_QUOTATION_PORT:8105}
+management:
+  server:
+    port: ${SECURITIES_QUOTATION_MANAGEMENT_PORT:18105}

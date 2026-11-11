@@ -1,108 +1,46 @@
+/* 清算领域服务：处理成交价差与撤单解冻，不发送消息、不提交数据库。 */
 package com.itranswarp.exchange.clearing;
 
+import com.itranswarp.exchange.core.EngineState;
+import com.itranswarp.exchange.core.EngineState.Order;
+import com.itranswarp.exchange.enums.Direction;
 import java.math.BigDecimal;
 
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
+public final class ClearingService {
+  /** 按 Maker 价结算并退回买单限价差；仍在同一候选事件内。 */
+  public void clearMatchResult(
+      EngineState next, Order buyer, Order seller, BigDecimal price, BigDecimal quantity) {
+    require(buyer.security() == seller.security(), "跨证券清算");
+    BigDecimal reserved = buyer.price().multiply(quantity), paid = price.multiply(quantity);
+    var cash = next.cash(buyer.user());
+    var position = next.position(seller.user(), seller.security());
+    require(
+        cash.frozen().compareTo(reserved) >= 0 && position.frozen().compareTo(quantity) >= 0,
+        "清算冻结不足");
+    cash.frozen(reserved.negate());
+    cash.available(reserved.subtract(paid));
+    next.cash(seller.user()).available(paid);
+    position.frozen(quantity.negate());
+    next.position(buyer.user(), buyer.security()).available(quantity);
+  }
 
-import com.itranswarp.exchange.assets.AssetService;
-import com.itranswarp.exchange.assets.Transfer;
-import com.itranswarp.exchange.enums.AssetEnum;
-import com.itranswarp.exchange.match.MatchDetailRecord;
-import com.itranswarp.exchange.match.MatchResult;
-import com.itranswarp.exchange.model.trade.OrderEntity;
-import com.itranswarp.exchange.order.OrderService;
-import com.itranswarp.exchange.support.LoggerSupport;
+  /** 撤单仅退回剩余委托冻结，已成交部分不回滚。 */
+  public void clearCancelOrder(EngineState next, Order order) {
+    var balance =
+        order.direction() == Direction.BUY
+            ? next.cash(order.user())
+            : next.position(order.user(), order.security());
+    BigDecimal amount =
+        order.direction() == Direction.BUY
+            ? order.price().multiply(order.remaining())
+            : order.remaining();
+    require(balance.frozen().compareTo(amount) >= 0, "撤单冻结不足");
+    balance.frozen(amount.negate());
+    balance.available(amount);
+  }
 
-@Component
-public class ClearingService extends LoggerSupport {
-
-    final AssetService assetService;
-
-    final OrderService orderService;
-
-    public ClearingService(@Autowired AssetService assetService, @Autowired OrderService orderService) {
-        this.assetService = assetService;
-        this.orderService = orderService;
-    }
-
-    public void clearMatchResult(MatchResult result) {
-        OrderEntity taker = result.takerOrder;
-        switch (taker.direction) {
-        case BUY -> {
-            // 买入时，按Maker的价格成交：
-            for (MatchDetailRecord detail : result.matchDetails) {
-                if (logger.isDebugEnabled()) {
-                    logger.debug(
-                            "clear buy matched detail: price = {}, quantity = {}, takerOrderId = {}, makerOrderId = {}, takerUserId = {}, makerUserId = {}",
-                            detail.price(), detail.quantity(), detail.takerOrder().id, detail.makerOrder().id,
-                            detail.takerOrder().userId, detail.makerOrder().userId);
-                }
-                OrderEntity maker = detail.makerOrder();
-                BigDecimal matched = detail.quantity();
-                if (taker.price.compareTo(maker.price) > 0) {
-                    // 实际买入价比报价低，部分USD退回账户:
-                    BigDecimal unfreezeQuote = taker.price.subtract(maker.price).multiply(matched);
-                    logger.debug("unfree extra unused quote {} back to taker user {}", unfreezeQuote, taker.userId);
-                    assetService.unfreeze(taker.userId, AssetEnum.USD, unfreezeQuote);
-                }
-                // 买方USD转入卖方账户:
-                assetService.transfer(Transfer.FROZEN_TO_AVAILABLE, taker.userId, maker.userId, AssetEnum.USD,
-                        maker.price.multiply(matched));
-                // 卖方BTC转入买方账户:
-                assetService.transfer(Transfer.FROZEN_TO_AVAILABLE, maker.userId, taker.userId, AssetEnum.BTC, matched);
-                // 删除完全成交的Maker:
-                if (maker.unfilledQuantity.signum() == 0) {
-                    orderService.removeOrder(maker.id);
-                }
-            }
-            // 删除完全成交的Taker:
-            if (taker.unfilledQuantity.signum() == 0) {
-                orderService.removeOrder(taker.id);
-            }
-        }
-        case SELL -> {
-            for (MatchDetailRecord detail : result.matchDetails) {
-                if (logger.isDebugEnabled()) {
-                    logger.debug(
-                            "clear sell matched detail: price = {}, quantity = {}, takerOrderId = {}, makerOrderId = {}, takerUserId = {}, makerUserId = {}",
-                            detail.price(), detail.quantity(), detail.takerOrder().id, detail.makerOrder().id,
-                            detail.takerOrder().userId, detail.makerOrder().userId);
-                }
-                OrderEntity maker = detail.makerOrder();
-                BigDecimal matched = detail.quantity();
-                // 卖方BTC转入买方账户:
-                assetService.transfer(Transfer.FROZEN_TO_AVAILABLE, taker.userId, maker.userId, AssetEnum.BTC, matched);
-                // 买方USD转入卖方账户:
-                assetService.transfer(Transfer.FROZEN_TO_AVAILABLE, maker.userId, taker.userId, AssetEnum.USD,
-                        maker.price.multiply(matched));
-                // 删除完全成交的Maker:
-                if (maker.unfilledQuantity.signum() == 0) {
-                    orderService.removeOrder(maker.id);
-                }
-            }
-            // 删除完全成交的Taker:
-            if (taker.unfilledQuantity.signum() == 0) {
-                orderService.removeOrder(taker.id);
-            }
-        }
-        default -> throw new IllegalArgumentException("Invalid direction.");
-        }
-    }
-
-    public void clearCancelOrder(OrderEntity order) {
-        switch (order.direction) {
-        case BUY -> {
-            // 解冻USD = 价格 x 未成交数量
-            assetService.unfreeze(order.userId, AssetEnum.USD, order.price.multiply(order.unfilledQuantity));
-        }
-        case SELL -> {
-            // 解冻BTC = 未成交数量
-            assetService.unfreeze(order.userId, AssetEnum.BTC, order.unfilledQuantity);
-        }
-        default -> throw new IllegalArgumentException("Invalid direction.");
-        }
-        // 从OrderService中删除订单:
-        orderService.removeOrder(order.id);
-    }
+  /** 不变量错误继续向核心传播，禁止带半状态继续交易。 */
+  private static void require(boolean condition, String message) {
+    if (!condition) throw new IllegalStateException(message);
+  }
 }

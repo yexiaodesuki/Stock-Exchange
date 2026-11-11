@@ -1,123 +1,107 @@
-/* 活动订单服务：实时下单冻结资产；快照恢复仅重建索引，不重复冻结或撮合。 */
+/* 订单领域服务：规则、冻结、订单创建与撤销；撮合和清算分别委托专用服务。 */
 package com.itranswarp.exchange.order;
 
-import java.math.BigDecimal;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
+import static com.itranswarp.exchange.core.EngineState.number;
 
 import com.itranswarp.exchange.assets.AssetService;
-import com.itranswarp.exchange.enums.AssetEnum;
-import com.itranswarp.exchange.enums.Direction;
-import com.itranswarp.exchange.model.trade.OrderEntity;
+import com.itranswarp.exchange.clearing.ClearingService;
+import com.itranswarp.exchange.core.*;
+import com.itranswarp.exchange.core.EngineState.Order;
+import com.itranswarp.exchange.match.MatchEngine;
+import com.itranswarp.exchange.securities.SecuritiesProtocol.*;
+import com.itranswarp.exchange.securities.SecurityCatalog;
+import com.itranswarp.exchange.securities.output.ExecutionEnvelope;
+import java.util.*;
 
-@Component
-public class OrderService {
+public final class OrderService {
+  private final SecurityCatalog catalog;
+  private final AssetService assets;
+  private final MatchEngine matching;
+  private final ClearingService clearing;
 
-    final AssetService assetService;
+  /** 每个核心拥有自己的协作对象，但它们不各自持有交易状态。 */
+  public OrderService(
+      SecurityCatalog catalog,
+      AssetService assets,
+      MatchEngine matching,
+      ClearingService clearing) {
+    this.catalog = catalog;
+    this.assets = assets;
+    this.matching = matching;
+    this.clearing = clearing;
+  }
 
-    public OrderService(@Autowired AssetService assetService) {
-        this.assetService = assetService;
+  /** 校验顺序、拒绝原因、冻结计算和订单 ID 均与重构前一致。 */
+  public ExecutionResult createOrder(EngineState next, SequencedEvent event, PlaceOrder request) {
+    try {
+      request.validate(catalog);
+    } catch (IllegalArgumentException invalid) {
+      return reject(event, "INVALID_ORDER");
     }
+    if (!assets.tryFreeze(
+        next,
+        event.userId(),
+        request.securityId(),
+        request.direction(),
+        request.price(),
+        request.quantity())) return reject(event, "INSUFFICIENT_BALANCE");
+    var taker =
+        new Order(
+            new SecuritiesSnapshot.Order(
+                event.sequenceId(),
+                event.sequenceId(),
+                event.userId(),
+                request.securityId(),
+                request.direction(),
+                number(request.price()),
+                number(request.quantity()),
+                number(request.quantity()),
+                event.createdAt(),
+                event.createdAt()));
+    return matching.processOrder(next, event, taker);
+  }
 
-    // 跟踪所有活动订单:
-    final ConcurrentMap<Long, OrderEntity> activeOrders = new ConcurrentHashMap<>();
+  /** 归属与证券均匹配才委托清算解冻，随后同时移除活动订单和盘口索引。 */
+  public ExecutionResult cancelOrder(EngineState next, SequencedEvent event, CancelOrder request) {
+    Order order = next.order(request.orderId());
+    if (order == null || order.user() != event.userId() || order.security() != request.securityId())
+      return reject(event, "ORDER_NOT_FOUND");
+    clearing.clearCancelOrder(next, order);
+    next.remove(order);
+    next.market(order.security()).sequence(event.sequenceId());
+    order.updated(event.createdAt());
+    return new ExecutionResult(
+        event.sequenceId(),
+        true,
+        "OK",
+        order.id(),
+        List.of(),
+        List.of(
+            change(
+                order,
+                order.remaining().compareTo(order.quantity()) == 0
+                    ? "FULLY_CANCELLED"
+                    : "PARTIAL_CANCELLED")));
+  }
 
-    // 跟踪用户活动订单:
-    final ConcurrentMap<Long, ConcurrentMap<Long, OrderEntity>> userOrders = new ConcurrentHashMap<>();
+  /** 复制关闭前的完整订单字段，保证成交和撤销都能进入历史。 */
+  public static ExecutionEnvelope.OrderChange change(Order order, String status) {
+    return new ExecutionEnvelope.OrderChange(
+        order.id(),
+        order.sequence(),
+        order.user(),
+        order.security(),
+        order.direction(),
+        order.price(),
+        order.quantity(),
+        order.remaining(),
+        status,
+        order.created(),
+        order.updated());
+  }
 
-    /**
-     * 创建订单，失败返回null:
-     */
-    public OrderEntity createOrder(long sequenceId, long ts, Long orderId, Long userId, Direction direction,
-            BigDecimal price, BigDecimal quantity) {
-        switch (direction) {
-        case BUY -> {
-            // 买入，需冻结USD：
-            if (!assetService.tryFreeze(userId, AssetEnum.USD, price.multiply(quantity))) {
-                return null;
-            }
-        }
-        case SELL -> {
-            // 卖出，需冻结BTC：
-            if (!assetService.tryFreeze(userId, AssetEnum.BTC, quantity)) {
-                return null;
-            }
-        }
-        default -> throw new IllegalArgumentException("Invalid direction.");
-        }
-        OrderEntity order = new OrderEntity();
-        order.id = orderId;
-        order.sequenceId = sequenceId;
-        order.userId = userId;
-        order.direction = direction;
-        order.price = price;
-        order.quantity = quantity;
-        order.unfilledQuantity = quantity;
-        order.createdAt = order.updatedAt = ts;
-        // 添加到ActiveOrders:
-        this.activeOrders.put(order.id, order);
-        // 添加到UserOrders:
-        ConcurrentMap<Long, OrderEntity> uOrders = this.userOrders.get(userId);
-        if (uOrders == null) {
-            uOrders = new ConcurrentHashMap<>();
-            this.userOrders.put(userId, uOrders);
-        }
-        uOrders.put(order.id, order);
-        return order;
-    }
-
-    public ConcurrentMap<Long, OrderEntity> getActiveOrders() {
-        return this.activeOrders;
-    }
-
-    /** 在恢复阶段直接登记已校验的活动订单，各索引共享同一对象；不执行资金操作。 */
-    public void restoreOrder(OrderEntity order) {
-        if (this.activeOrders.putIfAbsent(order.id, order) != null) {
-            throw new IllegalArgumentException("快照活动订单 ID 重复");
-        }
-        this.userOrders.computeIfAbsent(order.userId, user -> new ConcurrentHashMap<>()).put(order.id, order);
-    }
-
-    public OrderEntity getOrder(Long orderId) {
-        return this.activeOrders.get(orderId);
-    }
-
-    public ConcurrentMap<Long, OrderEntity> getUserOrders(Long userId) {
-        return this.userOrders.get(userId);
-    }
-
-    // 删除活动订单:
-    public void removeOrder(Long orderId) {
-        // 从ActiveOrders中删除:
-        OrderEntity removed = this.activeOrders.remove(orderId);
-        if (removed == null) {
-            throw new IllegalArgumentException("Order not found by orderId in active orders: " + orderId);
-        }
-        // 从UserOrders中删除:
-        ConcurrentMap<Long, OrderEntity> uOrders = userOrders.get(removed.userId);
-        if (uOrders == null) {
-            throw new IllegalArgumentException("User orders not found by userId: " + removed.userId);
-        }
-        if (uOrders.remove(orderId) == null) {
-            throw new IllegalArgumentException("Order not found by orderId in user orders: " + orderId);
-        }
-    }
-
-    public void debug() {
-        System.out.println("---------- orders ----------");
-        List<OrderEntity> orders = new ArrayList<>(this.activeOrders.values());
-        Collections.sort(orders);
-        for (OrderEntity order : orders) {
-            System.out.println("  " + order.id + " " + order.direction + " price: " + order.price + " unfilled: "
-                    + order.unfilledQuantity + " quantity: " + order.quantity + " sequenceId: " + order.sequenceId
-                    + " userId: " + order.userId);
-        }
-        System.out.println("---------- // orders ----------");
-    }
+  /** 正常拒绝不抛内部异常，仍由核心推进事件位置。 */
+  private ExecutionResult reject(SequencedEvent event, String reason) {
+    return new ExecutionResult(event.sequenceId(), false, reason, null, List.of());
+  }
 }

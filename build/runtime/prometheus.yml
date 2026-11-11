@@ -1,0 +1,28 @@
+# 抓取 IDEA 中的证券应用管理端口；Java 仍保持仅本机监听，不扩大暴露范围。
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: securities-engine
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [host.docker.internal:18102]
+  - job_name: securities-sequencer
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [host.docker.internal:18103]
+  - job_name: securities-quotation
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [host.docker.internal:18105]
+  - job_name: securities-api
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [host.docker.internal:18101]
+  - job_name: securities-ui
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [host.docker.internal:18100]
+  - job_name: securities-config
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [host.docker.internal:18888]

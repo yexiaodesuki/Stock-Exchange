@@ -1,5 +1,5 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-	<!-- 本应用监控依赖：沿用 Boot 版本管理，不升级现有业务框架。 -->
+	<!-- 证券唯一入口与集中配置客户端，不再打包旧交易实现。 -->
 	<modelVersion>4.0.0</modelVersion>
 
 	<parent>
@@ -45,6 +45,7 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+				<configuration><mainClass>com.itranswarp.exchange.SecuritiesApiApplication</mainClass></configuration>
 			</plugin>
 		</plugins>
 	</build>

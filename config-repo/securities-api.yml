@@ -1,0 +1,27 @@
+# 证券 api 专属配置；入金策略及只读行情/知识查询限制集中管理，不保存敏感值。
+server:
+  port: ${SECURITIES_API_PORT:8101}
+management:
+  server:
+    port: ${SECURITIES_API_MANAGEMENT_PORT:18101}
+securities:
+  assistant:
+    market:
+      default-hours: 24
+      max-days: 7
+      # 超过数量明确要求缩短范围，不用截断样本冒充全量统计。
+      max-trades-per-security: 10000
+    knowledge:
+      max-sections: 3
+    rag:
+      enabled: ${SEC_RAG_ENABLED:true}
+      embedding-url: http://127.0.0.1:${SEC_EMBEDDING_PORT:18081}
+      chroma-url: http://127.0.0.1:${SEC_CHROMA_PORT:18080}
+      # 余弦距离仅是召回门槛，不是正确概率；由项目检索样例评测调整。
+      max-distance: 0.46
+  deposits:
+    # 仅模拟资金，真实部署必须关闭；无银行卡或支付回调。
+    enabled: ${SECURITIES_DEPOSITS_ENABLED:true}
+    minimum: 1.00
+    maximum: 100000.00
+    daily: 500000.00

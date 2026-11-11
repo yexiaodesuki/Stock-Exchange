@@ -1,5 +1,16 @@
+# 本地仅保存应用名、配置中心入口和私密占位符，不保存实际密码。
 spring:
   application:
-    name: trading-api
+    name: securities-api
   config:
-    import: configserver:${CONFIG_SERVER:http://localhost:8888}
+    import:
+      - optional:file:./build/.env.securities[.properties]
+      - configserver:${CONFIG_SERVER:http://127.0.0.1:8888}
+  cloud:
+    config:
+      enabled: true
+      fail-fast: true
+  datasource:
+    password: ${SECURITIES_DB_PASSWORD:${SEC_MYSQL_PASSWORD}}
+securities:
+  auth-key: ${SECURITIES_AUTH_KEY}
