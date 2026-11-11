@@ -17,7 +17,7 @@
 ### 1. 获取代码并配置一次
 
 ```powershell
-git clone -b feat/securities-exchange https://github.com/yexiaodesuki/Stock-Exchange.git
+git clone --branch main https://github.com/yexiaodesuki/Stock-Exchange.git
 cd Stock-Exchange
 Copy-Item .\build\.env.securities.example .\build\.env.securities
 ```
@@ -65,6 +65,17 @@ Copy-Item .\build\.env.securities.example .\build\.env.securities
 
 设为 `SEC_RAG_ENABLED=false` 时，`-Rag` 或 `-Full` 也会跳过 RAG。知识回答会明确区分生成、检索原文和降级。外部分类会发送问题；知识生成还会附上公开文档片段，不附带账户数据。请勿在问题中输入密钥、密码或其他隐私。详见 [助手说明](docs/assistant.md)。
 
+## 技术栈
+
+| 层次 | 技术与用途 |
+| --- | --- |
+| 后端与构建 | Java 17、Spring Boot、Spring Cloud Config、Maven 多模块 |
+| 数据与事件 | MySQL 持久化、Flyway 迁移、Kafka 事件流转、Redis 查询缓存与推送分发 |
+| 页面与实时通信 | HTML、CSS、原生 JavaScript 模块、Canvas K 线、Vert.x WebSocket |
+| 网关与环境 | Nginx 统一入口、Docker Compose 管理依赖、PowerShell 管理宿主机 Java 应用 |
+| 可选监控 | Spring Boot Actuator、Prometheus、Grafana |
+| 可选知识问答 | Python、Sentence Transformers、BGE 中文嵌入、Chroma、兼容 Chat Completions 的外部生成接口 |
+
 ## 系统架构
 
 ```text
@@ -72,15 +83,28 @@ Copy-Item .\build\.env.securities.example .\build\.env.securities
          └────→ WebSocket Push ←──────────── 行情与业务输出
 ```
 
-| 模块 | 职责 |
-| --- | --- |
-| `config`、`config-repo` | Spring Cloud Config 服务及公共配置；私密配置保留在本机 |
-| `trading-api`、`trading-sequencer` | 接收与查询交易请求、分配事件顺序 |
-| `trading-engine` | 资金、持仓、订单、撮合、清算及恢复 |
-| `quotation`、`push`、`ui` | 成交与 K 线查询、WebSocket 推送、页面和会话 |
-| `common`、`parent`、`build` | 共享协议、依赖管理、Maven 聚合、Compose、SQL 与测试脚本 |
-
 MySQL 保存业务数据、持久事件和快照；Kafka 承载事件流转；Redis 用于查询缓存和推送分发，不作为资产恢复的权威来源。监控与 RAG 独立于撮合清算。更多代码入口见 [业务分层](docs/business-layering.md) 和 [目录约定](docs/package-layout.md)。
+
+## 项目结构
+
+```text
+Stock-Exchange/
+├─ build/               Maven 聚合入口、Compose、网关、监控、SQL 和测试脚本
+│  └─ rag/embedding/    本地嵌入服务的镜像和源码
+├─ parent/              公共依赖与构建配置
+├─ common/              共享证券协议、持久化和缓存组件
+├─ config/              Spring Cloud Config Server
+├─ config-repo/         公共配置与各应用配置，不存放本机密钥
+├─ trading-api/         交易与查询接口、模拟入金、只读助手
+├─ trading-sequencer/   事件定序与持久化
+├─ trading-engine/      资金、持仓、订单、撮合清算与快照恢复
+├─ quotation/           成交与 K 线行情
+├─ push/                WebSocket 实时推送
+├─ ui/                  交易页面、登录会话与 API 代理
+├─ docs/                运行、架构和验收文档
+├─ start.ps1            按需打包和启动
+└─ stop.ps1             停止脚本管理的 Java 应用
+```
 
 ## 停止、验证与进一步阅读
 
