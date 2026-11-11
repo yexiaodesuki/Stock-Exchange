@@ -1,10 +1,13 @@
-﻿# 一键启动证券环境：补齐六个容器，按需打包，配置中心先就绪，最后验证网关，不重置数据。
+﻿# 一键启动证券环境：四个核心容器，按需添加监控和 RAG；配置中心先就绪，不重置数据。
 #requires -Version 5.1
 param(
     [switch]$SkipBuild,
     [switch]$Rebuild,
     [switch]$NoBrowser,
-    [ValidateRange(10, 600)][int]$StartupTimeoutSeconds = 120
+    [ValidateRange(10, 600)][int]$StartupTimeoutSeconds = 120,
+    [switch]$Monitoring,
+    [switch]$Rag,
+    [switch]$Full
 )
 
 # 读取简单 KEY=value 配置，不执行文件内容，也不把密码放到命令行或日志。
@@ -55,26 +58,37 @@ function New-ExchangeApplicationPlan {
     }
 }
 
-# 六个容器均存在且运行健康才允许跳过 Compose，不把容器存在当作已就绪。
+# 只检查所需组；监控与知识库不能成为交易的健康门槛。
 function Test-ExchangeContainersReady {
-    param([array]$States)
-    foreach ($name in @('mysql', 'redis', 'kafka', 'grafana', 'prometheus', 'nginx')) {
+    param([array]$States, [string[]]$Names = @('mysql', 'redis', 'kafka', 'nginx'))
+    foreach ($name in $Names) {
         $rows = @($States | Where-Object { $_.Name -eq $name })
         if ($rows.Count -ne 1 -or $rows[0].State -ne 'running' -or $rows[0].Health -ne 'healthy') { return $false }
     }
     return $true
 }
 
-# 所有容器健康时完全跳过启动；否则只让 Compose 补齐，不删除卷或重建已有容器。
+# 核心容器健康时跳过启动；否则只补齐核心组，不删除卷或重建已有容器。
 function Ensure-ExchangeContainers {
     param([scriptblock]$Inspect, [scriptblock]$StartContainers)
     if (Test-ExchangeContainersReady @(& $Inspect)) {
-        Write-Host '六个 Docker 容器均已运行且健康，跳过容器启动。'
+        Write-Host '四个核心容器均已运行且健康，跳过核心容器启动。'
         return
     }
     Write-Host '正在补齐并等待 Docker 容器健康；首次运行可能需要下载镜像 ...'
     & $StartContainers
     if (!(Test-ExchangeContainersReady @(& $Inspect))) { throw 'Docker 容器未全部就绪，禁止启动 Java 应用。' }
+}
+
+# 交易已就绪后独立启动选中的可选组；单组失败不阻断另一组，也不回滚 Java。
+function Start-ExchangeOptionalGroups {
+    param([switch]$Monitoring, [switch]$Rag, [switch]$Full, [scriptblock]$StartMonitoring, [scriptblock]$StartRag)
+    if ($Monitoring -or $Full) {
+        try { & $StartMonitoring } catch { Write-Warning '监控暂不可用，交易继续运行；请检查本轮 monitoring-services.log。' }
+    }
+    if ($Rag -or $Full) {
+        try { & $StartRag } catch { Write-Warning 'RAG 暂不可用，交易继续运行；请检查本轮 rag-services.log。' }
+    }
 }
 
 # RAG在核心Java已就绪后单独准备；模型下载或镜像失败只能警告，不能终止交易服务。
@@ -275,9 +289,10 @@ function Start-ExchangeApplication {
     Write-Host ($Application.Name + ' 已就绪。')
 }
 
-# 统一启动入口；可点运行或从任意工作目录调用，应用始终以项目根目录运行。
+# 默认只启动核心四容器；网关验证后按参数准备监控和 RAG，应用始终以项目根目录运行。
 function Start-ExchangeProject {
-    param([string]$ProjectRoot, [switch]$SkipBuild, [switch]$Rebuild, [switch]$NoBrowser, [int]$TimeoutSeconds = 120)
+    param([string]$ProjectRoot, [switch]$SkipBuild, [switch]$Rebuild, [switch]$NoBrowser, [int]$TimeoutSeconds = 120,
+        [switch]$Monitoring, [switch]$Rag, [switch]$Full)
     $ErrorActionPreference = 'Stop'
     if ($SkipBuild -and $Rebuild) { throw '-SkipBuild 与 -Rebuild 不能同时使用。' }
     $settings = Read-ExchangeSettings (Join-Path $ProjectRoot 'build/.env.securities')
@@ -294,7 +309,7 @@ function Start-ExchangeProject {
     if ($ports.Count -ne 14) { throw '应用业务端口与管理端口不能重复。' }
     $docker = (Get-Command docker -ErrorAction Stop).Source
     Ensure-ExchangeContainers -Inspect { Get-ExchangeContainerStates $docker } -StartContainers {
-        & $docker compose --env-file (Join-Path $ProjectRoot 'build/.env.securities') -f (Join-Path $ProjectRoot 'build/docker-compose.yml') up -d --wait --wait-timeout 180 --no-recreate mysql redis kafka grafana prometheus nginx
+        & $docker compose --env-file (Join-Path $ProjectRoot 'build/.env.securities') -f (Join-Path $ProjectRoot 'build/docker-compose.yml') up -d --wait --wait-timeout 180 --no-recreate mysql redis kafka nginx
         if ($LASTEXITCODE -ne 0) { throw 'Docker Compose 启动失败；请检查 Docker 和镜像下载，不会继续启动 Java。' }
     }
     $dependencies = @(
@@ -373,7 +388,15 @@ function Start-ExchangeProject {
         $gateway = [pscustomobject]@{ Name = 'Nginx 到 UI 的会话链路'; Kind = 'gateway'; ReadyUrl = $uiUrl + '/session' }
         Wait-ExchangeApplicationReady $gateway $TimeoutSeconds -Alive { return $true } -Probe { param($url) Invoke-RestMethod -Uri $url -TimeoutSec 3 }
         Write-Host ('所有应用已就绪：' + $uiUrl)
-        Ensure-ExchangeRag $docker $ProjectRoot $settings $runDirectory
+        Start-ExchangeOptionalGroups -Monitoring:$Monitoring -Rag:$Rag -Full:$Full -StartMonitoring {
+            if (Test-ExchangeContainersReady @(Get-ExchangeContainerStates $docker) @('prometheus', 'grafana')) {
+                Write-Host '监控容器已健康，跳过监控启动。'
+            } else {
+                & $docker compose --env-file (Join-Path $ProjectRoot 'build/.env.securities') -f (Join-Path $ProjectRoot 'build/docker-compose.yml') up -d --wait --wait-timeout 180 --no-recreate prometheus grafana *> (Join-Path $runDirectory 'monitoring-services.log')
+                if ($LASTEXITCODE -ne 0) { throw '监控容器启动失败。' }
+                Write-Host 'Prometheus 和 Grafana 已就绪。'
+            }
+        } -StartRag { Ensure-ExchangeRag $docker $ProjectRoot $settings $runDirectory }
         if (!$NoBrowser) {
             try { Start-Process $uiUrl -ErrorAction Stop }
             catch { Write-Warning ('应用已启动，但浏览器未能打开，请手动访问 ' + $uiUrl) }
@@ -386,6 +409,6 @@ function Start-ExchangeProject {
 
 # 点导入只加载函数，便于隔离测试；直接执行才连接依赖、启动应用和打开页面。
 if ($MyInvocation.InvocationName -ne '.') {
-    try { Start-ExchangeProject -ProjectRoot $PSScriptRoot -SkipBuild:$SkipBuild -Rebuild:$Rebuild -NoBrowser:$NoBrowser -TimeoutSeconds $StartupTimeoutSeconds }
+    try { Start-ExchangeProject -ProjectRoot $PSScriptRoot -SkipBuild:$SkipBuild -Rebuild:$Rebuild -NoBrowser:$NoBrowser -TimeoutSeconds $StartupTimeoutSeconds -Monitoring:$Monitoring -Rag:$Rag -Full:$Full }
     catch { Write-Error $_.Exception.Message; exit 1 }
 }

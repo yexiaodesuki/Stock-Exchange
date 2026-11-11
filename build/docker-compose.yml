@@ -7,6 +7,7 @@ x-runtime: &runtime
     options: {max-size: "10m", max-file: "3"}
 services:
   chroma:
+    profiles: [rag]
     <<: *runtime
     image: chromadb/chroma:1.0.20
     container_name: chroma
@@ -20,6 +21,7 @@ services:
       timeout: 3s
       retries: 20
   embedding:
+    profiles: [rag]
     <<: *runtime
     build: ./rag/embedding
     container_name: embedding
@@ -129,6 +131,7 @@ services:
       retries: 30
       start_period: 30s
   prometheus:
+    profiles: [monitoring]
     <<: *runtime
     image: prom/prometheus:v3.15.0
     container_name: prometheus
@@ -142,6 +145,7 @@ services:
       timeout: 5s
       retries: 20
   grafana:
+    profiles: [monitoring]
     <<: *runtime
     image: grafana/grafana:13.2.3
     container_name: grafana

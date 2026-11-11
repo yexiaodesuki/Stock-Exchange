@@ -74,7 +74,7 @@ if(chunks.isEmpty())return facts(List.of(),"RAG_NO_EVIDENCE","KNOWLEDGE_NOT_FOUN
 | `config-repo/securities-api.yml` | 公开地址、RAG开关、0.46距离、最多3片。 |
 | `ui/.../service/ApiProxyService.java` | 仅助手解释请求代理超时延长到15秒；其他仍9秒。 |
 | `ui/.../static/securities/assistant.mjs`、`index.html` | 区分生成/原文/降级，显示[K1]引用，说明外发范围；所有文本安全渲染。 |
-| `start.ps1` | 核心六容器/七Java先就绪，再构建准备两个可降级RAG容器；内容指纹避免无变化重复构建。 |
+| `start.ps1` | 核心四容器与七个 Java 应用先就绪，仅指定 `-Rag` 或 `-Full` 时才准备两个可降级 RAG 容器；内容指纹避免无变化重复构建。 |
 | `build/securities/test-startup.ps1` | 原13组之外新增关闭、构建缓存、故障仅警告三组；通过注入动作验证，不启动容器。 |
 | `build/.env.securities.example`、`.gitignore` | 公开可选配置及缓存忽略。实际私密配置仅补本机模型源路径，未改聊天凭据。 |
 | `RagLogicTest.java`、`RagLiveTest.java` | 假协议/引用约束，真实本机向量索引生命周期与30题小样本；不调用付费生成。 |

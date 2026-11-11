@@ -1,82 +1,98 @@
-<!-- 启动入口：Docker 运行基础设施与 Nginx，Java 可由根目录脚本或 IDEA 启动。 -->
+<!-- 项目首页：介绍模拟证券交易、首次启动、可选监控与知识问答。 -->
 # Stock Exchange
 
-Java 17 / Spring Boot 模拟证券交易所雏形，持续优化中。支持五只虚构股票兑 USD、共享资金账户、分证券持仓、撮合清算、事件与快照恢复、行情和推送。不用于真实资金交易。
+一个使用 Java 17、Spring Boot 和 Spring Cloud Config 构建的模拟证券交易系统。五只虚构股票共用一个 USD 资金账户，支持从注册、模拟入金、限价委托到撮合、清算和行情推送的完整演示。项目持续完善中，仅用于学习和演示，不连接真实券商或支付渠道。
 
-## 启动
+## 主要功能
 
-需要 Java 17、IDEA（导入 `build/pom.xml`）、Docker Desktop Linux 容器。
+- **交易与账户**：分证券持仓和订单簿、限价买卖、价格优先／时间优先撮合、部分成交、撤单解冻、历史委托和本人成交明细。
+- **模拟入金**：申请状态查询、原申请重试和幂等处理，不涉及真实资金，也不赠送股票。
+- **行情与恢复**：盘口、最近成交、多周期 K 线、WebSocket 更新；引擎通过快照和增量事件重放恢复。
+- **监控与只读助手**：可选 Prometheus／Grafana；助手支持本人账户、订单、入金和公开行情查询，以及带出处的项目知识问答。助手不能代替用户执行交易，也不提供价格预测。
 
-首次将 `build/.env.securities.example` 复制为同目录 `.env.securities`，填写数据库密码、32 字符以上签名密钥、Grafana 密码和十个用户密码，不能使用示例占位值。这个文件被 Git 忽略。
+## 快速启动
 
-也可以手动先启动容器，在 `build` 目录执行：
+以下命令适用于 Windows。请准备 **JDK 17、Maven、PowerShell 5.1 或 7、Docker Desktop（Linux 容器）**，并确认 `java`、`mvn` 和 `docker compose` 可用。使用脚本不需要 IDEA。首次构建需要网络拉取 Maven 依赖和容器镜像。
+
+### 1. 获取代码并配置一次
 
 ```powershell
-docker compose --env-file .env.securities up -d --wait
+git clone -b feat/securities-exchange https://github.com/yexiaodesuki/Stock-Exchange.git
+cd Stock-Exchange
+Copy-Item .\build\.env.securities.example .\build\.env.securities
 ```
 
-容器名称固定：核心六个为 `mysql`、`redis`、`kafka`、`grafana`、`prometheus`、`nginx`；知识 RAG 另用 `chroma`、`embedding`，仅本机开放 18080 / 18081。没有 Java 应用容器或迁移任务容器。首次构建嵌入镜像及下载模型需要网络；可复用本地模型缓存，详见 [助手说明](docs/assistant.md)。Nginx 为统一入口，HTTP 经 UI 代理、WebSocket 转 Push，内部及管理路径不公开，详见 [网关说明](docs/nginx.md)。
+只在首次配置时复制模板；已有 `.env.securities` 时不要覆盖。编辑 `build/.env.securities`，将 `replace-with-` 占位值换成本机生成的随机值：
 
-Docker Desktop 就绪并填写本地配置后，在项目根目录执行一键启动（容器可尚未开启）：
+- `SEC_MYSQL_ROOT_PASSWORD`、`SEC_MYSQL_PASSWORD`：MySQL 管理及应用密码。
+- `SECURITIES_AUTH_KEY`：至少 32 字符的签名密钥。
+- `SEC_GRAFANA_PASSWORD`：Grafana 管理密码，保留有效配置以供同一 Compose 文件使用。
+- 使用模板默认的演示模式时，填写 `SECURITIES_DEMO_USER1_PASSWORD` 至 `SECURITIES_DEMO_USER10_PASSWORD`；不需要演示账户可设置 `SECURITIES_DEMO_ENABLED=false`。
+
+真实配置被 Git 忽略，不要提交或分享。交易启动不需要模型路径或大模型 API 密钥。
+
+### 2. 启动并访问页面
+
+开启 Docker Desktop 后，在仓库根目录运行：
 
 ```powershell
 .\start.ps1
 ```
 
-脚本先检查核心六个容器，均健康就跳过，否则用现有 Compose 补齐并等待，不重建已有容器或删除数据卷。然后按需打包，先验证 Config 的六份客户端配置，再逐个等待应用及网关会话链路就绪。交易就绪后单独准备 RAG 容器，失败仅警告并退回原文知识查询；最后打开网关页面。支持 PowerShell 5.1 / 7；若执行策略阻止，可用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1`，无需更改系统策略。
+默认启动 **MySQL、Redis、Kafka、Nginx** 四个容器。脚本按需打包，在宿主机先启动 Config Server，再启动业务应用并检查网关。首次运行会初始化数据库与 Kafka Topic；不必另跑建表 SQL 或先手动执行 Compose。
 
-已有 JAR 且源码、资源、POM、打包 SQL 未变化时自动跳过 Maven；首次接管已有产物先核对时间，之后记录输入和 JAR 双指纹。`-Rebuild` 强制干净重建；`-SkipBuild` 显式使用现有 JAR，不保证与源码一致；`-NoBrowser` 不打开浏览器。日志、构建指纹和进程记录在被 Git 忽略的 `build/.local-run/`。重复执行复用本项目 JAR 进程；若需要重建但 Java 仍运行则拒绝覆盖，请先停止旧应用。未知端口占用（包括无法确认归属的 IDEA 实例）会明确报错，不自动停止。
+打开 [http://localhost:8080](http://localhost:8080)。若 PowerShell 执行策略阻止脚本，可使用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1`，不必改系统策略。
 
-停止脚本启动的 Java 应用，在根目录执行下方命令。它按依赖逆序检查历史启动记录，核对 PID、启动时间与本项目 JAR 后才终止，重复执行安全；不停止 Docker、不删除数据或日志。
+### 3. 体验交易
+
+- **普通账户**：注册后初始余额为零。登录后打开“模拟入金 / 入金记录”，等状态变为“已到账”，再选择证券，填写限价和整数股数提交买入委托。是否成交取决于是否存在匹配的对手单。
+- **演示账户**：全新环境启用演示模式时，初始化 `user1@example.com` 至 `user10@example.com`，密码来自本地配置。可以用两个独立浏览器会话分别挂卖单、买单，观察撮合后资金、持仓及成交明细的变化。
+- 提交后看“请求进度”和“当前委托”；未成交部分可撤销。超时不等于失败，先核对原请求，不要重复下单或入金。
+
+## 按需启动监控和 RAG
+
+| 命令 | 在核心四个容器之外启动 |
+| --- | --- |
+| `.\start.ps1 -Monitoring` | Prometheus、Grafana |
+| `.\start.ps1 -Rag` | Chroma、Embedding |
+| `.\start.ps1 -Full` | 两组全部开启，共八个容器 |
+
+监控和 RAG 不参与交易就绪判定。脚本不会自动停止已经运行的附加容器。仅运行 Compose 只会启动容器，不会启动宿主机上的 Java 应用；使用 IDEA 或手动 Compose 的步骤见 [运行说明](docs/running.md)。
+
+- **监控**：[Grafana](http://localhost:3000) 默认用户为 `admin`，首次初始化密码取本地配置；[Prometheus Targets](http://localhost:9090/targets) 可检查抓取状态。复用已有 Grafana 数据卷时，修改环境变量不会重置密码。
+- **本地 Embedding**：RAG 使用固定版本的 `BAAI/bge-small-zh-v1.5`，无需外部嵌入 API。保留 `SEC_RAG_MODEL_DOWNLOAD=true` 可首次联网下载；若已有相同版本，可把 `SEC_RAG_MODEL_SOURCE` 指向自己的 Hugging Face `hub` 缓存根目录。Java API 会自动将项目文档建索引，无需手动导入 Chroma。
+- **外部大模型**：默认关闭。不填密钥也可返回检索原文和出处。要启用外部生成，在 `build/.env.securities` 设置 `SEC_ASSISTANT_EXTERNAL_ENABLED=true`，并填写 `SEC_ASSISTANT_ENDPOINT`（完整的 HTTPS 聊天接口地址）、`SEC_ASSISTANT_MODEL` 和 `SEC_ASSISTANT_API_KEY`。知识生成默认跟随外部模型开关，也可用 `SEC_RAG_GENERATION_ENABLED=false` 单独关闭。供应商接口、模型权限和额度需要自行验证；修改配置后重启 API。
+
+设为 `SEC_RAG_ENABLED=false` 时，`-Rag` 或 `-Full` 也会跳过 RAG。知识回答会明确区分生成、检索原文和降级。外部分类会发送问题；知识生成还会附上公开文档片段，不附带账户数据。请勿在问题中输入密钥、密码或其他隐私。详见 [助手说明](docs/assistant.md)。
+
+## 系统架构
+
+```text
+浏览器 → Nginx → UI / 交易 API → Kafka → 定序 → 撮合与清算
+         └────→ WebSocket Push ←──────────── 行情与业务输出
+```
+
+| 模块 | 职责 |
+| --- | --- |
+| `config`、`config-repo` | Spring Cloud Config 服务及公共配置；私密配置保留在本机 |
+| `trading-api`、`trading-sequencer` | 接收与查询交易请求、分配事件顺序 |
+| `trading-engine` | 资金、持仓、订单、撮合、清算及恢复 |
+| `quotation`、`push`、`ui` | 成交与 K 线查询、WebSocket 推送、页面和会话 |
+| `common`、`parent`、`build` | 共享协议、依赖管理、Maven 聚合、Compose、SQL 与测试脚本 |
+
+MySQL 保存业务数据、持久事件和快照；Kafka 承载事件流转；Redis 用于查询缓存和推送分发，不作为资产恢复的权威来源。监控与 RAG 独立于撮合清算。更多代码入口见 [业务分层](docs/business-layering.md) 和 [目录约定](docs/package-layout.md)。
+
+## 停止、验证与进一步阅读
 
 ```powershell
 .\stop.ps1
-```
-
-Windows 下使用进程终止，不保证 JVM 优雅关闭；不要把批量结束所有 java.exe 当作替代方法。IDEA 启动的实例仍用 IDEA Stop。
-
-也可以继续使用 IDEA；所有应用的 Working directory 均为项目根目录，依次运行：
-
-1. `ConfigApplication`。
-2. `SecuritiesEngineApplication`。
-3. `SecuritiesSequencerApplication`、`SecuritiesQuotationApplication`。
-4. `SecuritiesApiApplication`、`SecuritiesPushApplication`。
-5. `SecuritiesUIApplication`。
-
-业务应用直接读取 `build/.env.securities`，再从 Config Server 读取公共配置；无需在启动脚本中导出密码。MySQL 容器创建数据库，Java 应用首次连接时自动执行全部 Flyway 迁移（含快照表），重复启动只校验版本。Kafka 在自己的容器内创建并校验 Topic。
-
-交易入口：[localhost:8080](http://localhost:8080)；本机 UI 调试端口仍为 8100（默认推送通过网关）；Grafana：[localhost:3000](http://localhost:3000)；Prometheus：[localhost:9090](http://localhost:9090)。当前仅本地 HTTP，不是公网生产部署。
-
-## 账户与数据
-
-普通注册账户初始余额为零，登录后点击“模拟入金 / 入金记录”主动增加模拟 USD。默认单笔 1～100000 USD、每日累计 500000 USD（UTC，含待确认申请）；已有用户也可使用，不重置资产或历史。入金通过持久申请、事务发件箱及原交易引擎完成，详见 [模拟入金说明](docs/deposits.md)。不涉及真实支付。
-
-全新环境设置 `SECURITIES_DEMO_ENABLED=true` 后自动创建 `user1@example.com` 至 `user10@example.com`，名称“用户一”至“用户十”，密码分别取配置中的十个用户密码。初始化通过真实事件链配资、挂单、撮合，可重复启动且不会重复配资。
-
-旧两用户演示环境启用演示初始化后，默认保留 `buyer@example.com`、`seller@example.com` 并补齐 `user3@example.com` 至 `user10@example.com`；新增用户各有 100000 USD 和五证券各 1000 股。另行明确授权后可仅迁移原两人的登录邮箱和密码，不变更用户 ID、资产及交易记录；本机已完成该维护，现使用 user1 至 user10 登录。普通重启不会重置密码或重复配资，详见 [演示用户补齐](docs/demo-users.md)。容器和数据卷不是同一个东西；日常停止使用 `docker compose --env-file .env.securities stop`，不要删除数据卷。
-
-## 模块与配置
-
-交易链：UI → API → Kafka → 定序 → MySQL 事件 → 引擎撮合清算 → 行情 / 推送 → 页面。引擎以一致性快照加事件增量重放恢复。
-
-- `common`：证券协议、目录、自动迁移、持久输出与缓存。
-- `config / config-repo`：配置服务和非敏感公共 / 应用配置。
-- `trading-engine / trading-sequencer`：资金、持仓、订单、撮合清算、恢复和定序。
-- `trading-api / quotation / push / ui`：接口、行情、WebSocket 和页面。
-- `build`：唯一 Compose、Maven 聚合入口，以及 SQL、监控和测试配套目录。
-
-旧 BTC 实现已移除；各模块使用标准 Maven 源码目录，业务代码统一在 com.itranswarp.exchange 包下。启动入口统一位于模块根包，装配放 config，运行协调使用 Service，接口放 web；完整目录约定见 [统一目录结构](docs/package-layout.md)。各应用本地引导为 src/main/resources/application.yml；保留通用工具和现有证券交易实现。
-
-阅读代码可从 [业务分层与调用关系](docs/business-layering.md) 开始：引擎按资产、订单、撮合、清算分工，API 使用 Controller → Service，后台协调器只负责运行流程。UI 页面保持原样。
-
-## 监控与验证
-
-Grafana 使用 admin 和本地配置的密码，打开 Securities 文件夹内的“证券交易所 - 系统总览”。只有启动对应 Java 应用后，Prometheus 的该应用 Target 才会变为 UP。Java 管理端口保持本机监听；Docker Desktop 使用 `host.docker.internal` 访问，不开放局域网管理入口。其他平台可能需要额外的本机网络接入配置。
-
-```powershell
 mvn -f build/pom.xml test
 ```
 
-这只代表可运行的 Maven 测试，不等于完整联调。隔离数据库、恢复及真实进程联调方式见 [运行与验证说明](docs/running.md)。测试脚本仅用于验收，不参与环境启动。
+`stop.ps1` 只停止脚本管理的 Java 应用，不停止 Docker。需要暂停全部容器时，可从根目录执行 `docker compose --env-file build/.env.securities -f build/docker-compose.yml --profile monitoring --profile rag stop`。不要把删除数据卷当作普通重启。若需要强制重新打包，先停止旧 Java 应用，再运行 `.\start.ps1 -Rebuild`，并按需加启动选项。
 
-后续继续完善监控、网关、可靠性和受控 AI 辅助能力；当前不具备生产级交易所保障。
+- [运行与联调](docs/running.md)：IDEA 启动、端口、容器和隔离验证步骤。
+- [验收记录](docs/verification.md)：交易、恢复和集成验证范围；普通 Maven 测试不等于完整联调。
+- [网关](docs/nginx.md) · [模拟入金](docs/deposits.md) · [演示账户](docs/demo-users.md) · [RAG 实现](docs/rag-implementation.md)。
+
+当前配置面向本地开发和演示，默认使用本地 HTTP，不是公网部署方案，也不提供生产级资金安全、高可用或模型回答正确性保证。

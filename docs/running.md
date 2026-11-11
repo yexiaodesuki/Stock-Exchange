@@ -18,7 +18,7 @@ docker compose --env-file .env.securities up -d --wait
 docker compose --env-file .env.securities ps
 ```
 
-八个固定容器名不能在同一个 Docker 引擎中重复。因此本配置面向一个开发环境，不支持同机直接并行启动第二套同名栈。已有手工 nginx 须先确认用途，启动脚本不会删除或接管它。首次含嵌入镜像构建和模型下载，可能超过 Compose 的默认健康等待时间；可先 `docker compose --env-file .env.securities build embedding`，再 `docker compose --env-file .env.securities up -d --wait --wait-timeout 600`。核心交易不依赖模型就绪，根目录启动脚本会将两者分开准备。
+上述命令默认启动 MySQL、Redis、Kafka、Nginx。手动启动完整环境时使用 `docker compose --env-file .env.securities --profile monitoring --profile rag up -d --build --wait --wait-timeout 600`；只需要一组就只指定对应 profile。首次构建嵌入镜像和下载模型可能较慢。八个固定容器名不能在同一个 Docker 引擎中重复；启动脚本不会删除或接管手工创建的同名容器。
 
 | 容器 | 宿主机端口 | 数据卷 |
 |---|---|---|
@@ -33,7 +33,7 @@ docker compose --env-file .env.securities ps
 
 全部发布到 127.0.0.1。保留既有卷名是为了保留证券数据和监控数据，Compose 对跨项目复用旧监控卷的标签警告不表示数据损坏。新克隆机器没有这些卷时会自动创建，不需要手工 docker volume create。
 
-`build/rag/embedding` 是 CPU 嵌入服务镜像源码，不含模型权重。`SEC_RAG_MODEL_SOURCE` 可指向 Hugging Face hub 缓存根目录，以只读方式复用固定版本的 BGE 模型；未设置时使用空目录并按固定版本下载到命名卷。私密配置示例、离线开关、分片及 RAG 降级见 [助手说明](assistant.md#无重排序-rag)。`SEC_RAG_ENABLED=false` 可关闭 Java 语义检索及脚本中的 RAG 准备，但手动不带服务名的 Compose up 仍会启动配置里的全部服务。
+`build/rag/embedding` 是 CPU 嵌入服务镜像源码，不含模型权重。`SEC_RAG_MODEL_SOURCE` 可指向 Hugging Face hub 缓存根目录，以只读方式复用固定版本的 BGE 模型；未设置时使用空目录并按固定版本下载到命名卷。私密配置示例、离线开关、分片及 RAG 降级见 [助手说明](assistant.md#无重排序-rag)。`SEC_RAG_ENABLED=false` 会关闭 Java 语义检索，也会让脚本跳过 RAG 准备，即使指定了 `-Rag` 或 `-Full`；手动开启 Compose 的 `rag` profile 则只控制容器，不改变 Java 配置。
 
 MySQL 只创建 exchange_securities 数据库和应用用户。证券目录加载入口 `SecurityCatalog.load` 先调用 `SchemaMigration.migrate`，使用 JAR 内打包的 V1/V2/V3 SQL；迁移完成才校验证券家族并创建业务服务。首次启动含快照表，不需要后来手动补表。Flyway 使用原历史表与数据库锁，并发启动可串行校验；版本校验失败拒绝启动，禁止用 repair、baseline 或清库绕过。
 
@@ -45,6 +45,10 @@ Kafka 主进程在同一个容器中受 shell 监督；就绪后执行幂等 Top
 
 ```powershell
 .\start.ps1
+# 按需开启监控、RAG，或完整环境：
+.\start.ps1 -Monitoring
+.\start.ps1 -Rag
+.\start.ps1 -Full
 # 已打包且无需更新代码：
 .\start.ps1 -SkipBuild
 # 强制重新打包（先停止旧 Java 应用）：
@@ -55,7 +59,7 @@ Kafka 主进程在同一个容器中受 shell 监督；就绪后执行幂等 Top
 
 支持 Windows PowerShell 5.1 和 PowerShell 7。脚本带 UTF-8 BOM，避免 5.1 将中文误读为其他编码。若本机执行策略拦截，可使用 powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1，仅作用于此次进程，不修改系统执行策略。
 
-脚本读取本 Compose 项目六个容器的名称、运行状态和健康状态，不展开包含密码的配置。都健康时跳过 Compose up；否则执行 up -d --wait --wait-timeout 180 --no-recreate，补齐并等待，不重建已有容器或删除卷。Docker Desktop 不可连接时明确失败。运行但不健康的容器会超时失败，不擅自重启数据库。修改挂载的 Nginx 配置须验证并 reload；修改容器环境须单独确认并更新，不能依赖跳过逻辑自动重建。网关健康仅说明进程存活，Java 全就绪后还会通过网关检查 /session，随后打开 localhost:8080。网络接入、安全边界及网关隔离验收见 [Nginx 说明](nginx.md)。
+脚本只要求核心四容器健康。都健康时跳过核心 Compose up，否则只补齐核心组并等待，不重建已有核心容器或删除卷。Docker Desktop 不可连接或核心服务不健康会阻止 Java 启动；监控与 RAG 不参与核心判定。Java 全就绪后通过网关检查 /session，再启动选中的附加组。监控等待容器健康；RAG 启动后模型和索引在后台准备。可选组失败只警告，不停止交易应用。未选择的组不会启动，也不会停止已运行的容器；若需释放资源，可在 build 目录显式运行 `docker compose --env-file .env.securities stop prometheus grafana chroma embedding`。入口仍为 localhost:8080，网关安全边界见 [Nginx 说明](nginx.md)。
 
 打包输入包括九个模块及 build 的 POM、src/main 源码与资源，以及 common 打包使用的 build/sql/securities/V*.sql。不含外置 config-repo、私密配置和日志。已有构建第一次按文件时间判断是否可接管，之后在 build/.local-run/build-state.json 保存输入及七个 JAR 的内容指纹；未变化自动跳过，缺 JAR、输入变化、产物不匹配则运行 Maven clean package -DskipTests。这个打包步骤不代表执行了测试。-Rebuild 强制重建，-SkipBuild 强制使用旧产物，两者互斥。需要构建而旧 Java 应用仍运行时明确拒绝，请先停止它们，不能覆盖运行中的 JAR。
 

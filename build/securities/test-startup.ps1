@@ -82,10 +82,10 @@ try {
 } finally { [Environment]::SetEnvironmentVariable($testKey, $previous, 'Process') }
 Write-Host 'PASS 8：配置优先级且不修改父环境'
 
-$healthy = @('mysql', 'redis', 'kafka', 'grafana', 'prometheus', 'nginx') | ForEach-Object { [pscustomobject]@{ Name = $_; State = 'running'; Health = 'healthy' } }
+$healthy = @('mysql', 'redis', 'kafka', 'nginx') | ForEach-Object { [pscustomobject]@{ Name = $_; State = 'running'; Health = 'healthy' } }
 $state = [pscustomobject]@{ Starts = 0; Inspections = 0 }
 Ensure-ExchangeContainers -Inspect { return $healthy } -StartContainers { $state.Starts++ }
-Assert-Startup ($state.Starts -eq 0) '五个容器健康时不得重复执行 Compose up'
+Assert-Startup ($state.Starts -eq 0) '四个核心容器健康时不依赖可选组，也不重复执行 Compose up'
 Assert-Startup (!(Test-ExchangeContainersReady @($healthy | Where-Object { $_.Name -ne 'kafka' }))) '缺容器不能跳过'
 Assert-Startup (!(Test-ExchangeContainersReady @($healthy | Where-Object { $_.Name -ne 'nginx' }))) '缺网关不能跳过'
 Assert-Startup (Test-ExchangeReadyResponse 'gateway' ([pscustomobject]@{csrf='proof';websocket='/ws'})) '网关会话链路应就绪'
@@ -168,4 +168,26 @@ try {
     [IO.Directory]::Delete((Join-Path $ragFixture 'build'))
     [IO.Directory]::Delete($ragFixture)
 }
-Write-Host '一键启动脚本隔离测试全部通过（16 组）。'
+# 验证四种启动组合，不连接 Docker；关闭某组即不执行该组回调。
+$optional = [System.Collections.Generic.List[string]]::new()
+$startMonitoring = { $optional.Add('monitoring') }
+$startRag = { $optional.Add('rag') }
+Start-ExchangeOptionalGroups -StartMonitoring $startMonitoring -StartRag $startRag
+Assert-Startup ($optional.Count -eq 0) '默认模式不启动可选组'
+Start-ExchangeOptionalGroups -Monitoring -StartMonitoring $startMonitoring -StartRag $startRag
+Assert-Startup (($optional -join ',') -eq 'monitoring') '监控模式不得启动 RAG'
+$optional.Clear()
+Start-ExchangeOptionalGroups -Rag -StartMonitoring $startMonitoring -StartRag $startRag
+Assert-Startup (($optional -join ',') -eq 'rag') 'RAG 模式不得启动监控'
+$optional.Clear()
+Start-ExchangeOptionalGroups -Full -StartMonitoring $startMonitoring -StartRag $startRag
+Assert-Startup (($optional -join ',') -eq 'monitoring,rag') '完整模式应启动两个可选组'
+Write-Host 'PASS 17：可选组的四种启动组合'
+
+# 模拟监控失败，仍须尝试 RAG；核心组判定忽略故障的监控容器。
+$optional.Clear()
+Start-ExchangeOptionalGroups -Full -StartMonitoring { throw '模拟监控故障' } -StartRag $startRag
+Assert-Startup (($optional -join ',') -eq 'rag') '监控失败不能阻止 RAG'
+Assert-Startup (Test-ExchangeContainersReady ($healthy + @([pscustomobject]@{Name='grafana';State='exited';Health='not-ready'}))) '监控失败不能阻断核心健康检查'
+Write-Host 'PASS 18：可选组故障隔离'
+Write-Host '一键启动脚本隔离测试全部通过（18 组）。'

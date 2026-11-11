@@ -15,6 +15,8 @@ public final class AssistantRules {
     String lower=question.toLowerCase(java.util.Locale.ROOT);
     boolean personal=question.matches("(?s).*(我的|本人|我.*(订单|委托|入金|充值|资金|余额|持仓)).*");
     if(question.matches("(?s).*(如何|怎么|怎样|哪里|在哪).*(入金|充值|下单|撤单|买入|卖出|注册|登录).*"))return Intent.KNOWLEDGE;
+    // 明确的操作说明走知识库；实际请求结果仍由本人数据分支或原页面提供。
+    if(!personal && question.matches("(?s).*(半股|价格最小单位|退出登录|会话过期|下单超时|撤单超时|提交超时|充值超时|入金超时|原申请重试|怎么看引用|模型降级|行情时间范围).*"))return Intent.KNOWLEDGE;
     if(question.matches("(?s).*(买入报价|报价).*(高于|低于).*(成交价).*"))return Intent.KNOWLEDGE;
     boolean concept=question.matches("(?s).*(是什么|什么意思|含义|规则|为什么|为何|如何生成|怎么生成|如何计算|怎么计算).*");
     if(lower.matches("(?s).*(行情|走势|成交情况|成交摘要|成交量|成交金额|最近成交|最高价|最低价).*")&&!personal&&!concept)return Intent.MARKET;
