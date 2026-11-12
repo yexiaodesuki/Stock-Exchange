@@ -139,6 +139,13 @@ Assert-Startup (@($realInputs | Where-Object { $_.Name -eq '.env.securities' -or
 Write-Host 'PASS 13：实际内容哈希和输入边界'
 # 新知识服务的失败不能阻断交易，禁用时不读取目录或执行Docker。
 Ensure-ExchangeRag -Docker 'unused' -ProjectRoot 'Z:/does-not-exist' -Settings @{SEC_RAG_ENABLED='false'} -RunDirectory 'unused' -Inspect { throw '禁用时不应探测' } -BuildRag { throw '禁用时不应构建' }
+# 外部模式不能访问本地模型源码，也只能启动 Chroma。
+Ensure-ExchangeRag -Docker 'unused' -ProjectRoot 'Z:/does-not-exist' -Settings @{SEC_RAG_EMBEDDING_PROVIDER='external'} -RunDirectory 'unused' -Inspect { @() } -BuildRag {
+    param($service)
+    if ($service -ne 'chroma') { $script:wrongExternalRagService = $true }
+    $script:externalRagStarted = $true
+}
+if (!$script:externalRagStarted -or $script:wrongExternalRagService) { throw '外部RAG必须只启动Chroma' }
 Write-Host 'PASS 14：RAG禁用不准备模型'
 
 # 临时源码与状态只写入随机测试目录，不修改正式构建状态或启动容器。

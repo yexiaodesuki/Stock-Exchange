@@ -12,7 +12,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.Flow;
 
 public final class HttpAiModelClient implements AiModelClient {
-  private final boolean enabled;
+  private final boolean enabled,local;
   private final String endpoint,model,key;
   private final boolean disableThinking;
   private final HttpClient http=HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(1)).followRedirects(HttpClient.Redirect.NEVER).build();
@@ -23,21 +23,25 @@ public final class HttpAiModelClient implements AiModelClient {
   }
   /** 供应商扩展参数可显式关闭；默认仅为已验证的 DeepSeek 官方域名关闭思考。 */
   public HttpAiModelClient(boolean enabled,String endpoint,String model,String key,boolean disableThinking) {
-    this.enabled=enabled;this.endpoint=endpoint;this.model=model;this.key=key;
-    this.disableThinking=disableThinking;
-    if(enabled && !endpoint.isBlank() && !"https".equalsIgnoreCase(URI.create(endpoint).getScheme()))
-      throw new IllegalArgumentException("模型接口必须使用 HTTPS");
+    this(enabled,endpoint,model,key,disableThinking,false);
   }
-  /** 双重要求开关和完整凭据，未配置不产生收费调用。 */
-  @Override public boolean configured(){return enabled&&!endpoint.isBlank()&&!model.isBlank()&&!key.isBlank();}
+  /** 本地服务可无密钥；外部模式仍要求 HTTPS 和密钥。 */
+  public HttpAiModelClient(boolean enabled,String endpoint,String model,String key,boolean disableThinking,boolean local) {
+    this.enabled=enabled;this.endpoint=endpoint;this.model=model;this.key=key;this.local=local;
+    this.disableThinking=disableThinking;
+    if(enabled&&!endpoint.isBlank())ChatEndpoint.validate(endpoint,local);
+  }
+  /** 开关和端点完整才调用；只有本地模式允许缺少密钥。 */
+  @Override public boolean configured(){return enabled&&!endpoint.isBlank()&&!model.isBlank()&&(local||!key.isBlank());}
   /** 有界非思考分类，区分供应商拒绝、空答案、截断和协议错误，不回传供应商原文。 */
   @Override public String classify(String question) throws Exception {
     if(!configured())throw new IllegalStateException("模型未配置");
     var body=requestBody(question);
     var request=HttpRequest.newBuilder(URI.create(endpoint)).timeout(Duration.ofSeconds(2))
-        .header("Authorization","Bearer "+key).header("Content-Type","application/json")
-        .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(body))).build();
-    var future=http.sendAsync(request,info->new LimitedBody());
+        .header("Content-Type","application/json")
+        .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(body)));
+    if(!key.isBlank())request.header("Authorization","Bearer "+key);
+    var future=http.sendAsync(request.build(),info->new LimitedBody());
     try {
       var response=future.get(2300,TimeUnit.MILLISECONDS);
       return content(response.statusCode(),response.body());
