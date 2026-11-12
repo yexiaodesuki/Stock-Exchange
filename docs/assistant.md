@@ -46,7 +46,7 @@ SEC_EMBEDDING_PORT=18081
 SEC_RAG_MODEL_DOWNLOAD=true
 # 可选：自己的 Hugging Face hub 缓存根目录，不是模型快照目录
 SEC_RAG_MODEL_SOURCE=D:/huggingface_cache/hub
-# 可独立关闭知识生成；不设置时沿用 SEC_ASSISTANT_EXTERNAL_ENABLED
+# 可独立关闭知识生成；不设置时跟随所选聊天模式
 SEC_RAG_GENERATION_ENABLED=false
 ```
 

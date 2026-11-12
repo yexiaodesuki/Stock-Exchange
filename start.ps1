@@ -97,6 +97,16 @@ function Ensure-ExchangeRag {
     param([string]$Docker, [string]$ProjectRoot, [hashtable]$Settings, [string]$RunDirectory, [scriptblock]$Inspect, [scriptblock]$BuildRag)
     if ((Get-ExchangeSetting $Settings 'SEC_RAG_ENABLED' 'true') -eq 'false') { Write-Host 'RAG已关闭，使用原文知识查询。'; return }
     try {
+        $provider = Get-ExchangeSetting $Settings 'SEC_RAG_EMBEDDING_PROVIDER' 'local'
+        if ($provider -eq 'external') {
+            if (!$Inspect) { $Inspect = { Get-ExchangeContainerStates $Docker } }
+            if (Test-ExchangeContainersReady @(& $Inspect) @('chroma')) { return }
+            if ($BuildRag) { & $BuildRag 'chroma'; return }
+            & $Docker compose --env-file (Join-Path $ProjectRoot 'build/.env.securities') -f (Join-Path $ProjectRoot 'build/docker-compose.yml') up -d --no-deps chroma *> (Join-Path $RunDirectory 'rag-services.log')
+            if ($LASTEXITCODE -ne 0) { throw 'Chroma 容器准备失败' }
+            return
+        }
+        if ($provider -ne 'local') { throw '未知嵌入提供方' }
         $ragRoot = Join-Path $ProjectRoot 'build/rag/embedding'
         $inputs = @(Get-ChildItem -LiteralPath $ragRoot -File | Where-Object { $_.Extension -eq '.py' -or $_.Name -in @('Dockerfile', 'requirements.txt', '.dockerignore') })
         $hash = Get-ExchangeFilesFingerprint $ProjectRoot $inputs

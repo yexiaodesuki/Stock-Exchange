@@ -7,6 +7,8 @@
 
 `KnowledgeDocumentService` 的构造器只加载三个固定资源，`load` 校验文件大小和格式，`contentHash` 计算内容身份。`Section` 保存章节编号、文档名、标题、别名、原文、正文哈希版本；`Chunk` 保存片段编号、所属章节、原文和 token 数。都不是账户模型。`chunks` 校验父章节、顺序、token上限、UTF-16起止偏移及全文覆盖，不能用一个短片段冒充整章已索引。
 
+以下为默认本地模式。外部模式由 Java 的 `ExternalEmbeddingClient` 直接发送 HTTPS 请求，使用保守的 Unicode 码点切片（长度是估算，不是供应商 tokenizer），并按响应的 `index` 重排和归一化向量。端点、模型与修订号参与 Chroma 集合代次计算；API Key 不参与。配置见 [README](../README.md#embedding-模型配置)。
+
 `build/rag/embedding/model_loader.py` 固定模型和快照版本，先验证只读缓存，再按允许下载开关加载；`load_model` CPU预热后才可READY。`app.py` 的 `split_text` 使用真实 tokenizer 切片，`process` 区分查询/文档：
 
 ```python

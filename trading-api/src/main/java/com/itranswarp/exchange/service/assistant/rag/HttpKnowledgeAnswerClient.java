@@ -1,20 +1,24 @@
 /* 基于证据的有界聊天调用：与意图分类分离，检查结构、引用和数值；不保证消除所有语义幻觉。 */
 package com.itranswarp.exchange.service.assistant.rag;
-import java.net.URI;
+import com.itranswarp.exchange.service.assistant.ChatEndpoint;
 import java.math.BigDecimal;
 import java.util.*;
 import java.util.regex.Pattern;
 
 public final class HttpKnowledgeAnswerClient implements KnowledgeAnswerClient {
-  private final boolean enabled,disableThinking;private final String endpoint,model,key;
-  /** 沿用本地聊天配置但允许单独关闭；不允许用户覆盖端点或通过HTTP发送凭据。 */
+  private final boolean enabled,disableThinking,local;private final String endpoint,model,key;
+  /** 兼容已有外部 HTTPS 调用。 */
   public HttpKnowledgeAnswerClient(boolean enabled,String endpoint,String model,String key,String thinking){
-    this.enabled=enabled;this.endpoint=endpoint;this.model=model;this.key=key;
-    var uri=URI.create(endpoint.isBlank()?"https://unconfigured.invalid":endpoint);if(enabled&&!endpoint.isBlank()&&(!"https".equals(uri.getScheme())||uri.getUserInfo()!=null))throw new IllegalArgumentException("知识生成端点必须为HTTPS");
-    if(!Set.of("auto","true","false").contains(thinking))throw new IllegalArgumentException("思考配置无效");disableThinking=thinking.equals("true")||(thinking.equals("auto")&&"api.deepseek.com".equalsIgnoreCase(uri.getHost()));
+    this(enabled,endpoint,model,key,thinking,false);
   }
-  /** 没有完整凭据不生成，不能伪装成已经调用模型。 */
-  public boolean configured(){return enabled&&!endpoint.isBlank()&&!model.isBlank()&&!key.isBlank();}
+  /** 本地和外部模式共用端点限制与证据校验。 */
+  public HttpKnowledgeAnswerClient(boolean enabled,String endpoint,String model,String key,String thinking,boolean local){
+    this.enabled=enabled;this.endpoint=endpoint;this.model=model;this.key=key;this.local=local;
+    var uri=enabled&&!endpoint.isBlank()?ChatEndpoint.validate(endpoint,local):null;
+    if(!Set.of("auto","true","false").contains(thinking))throw new IllegalArgumentException("思考配置无效");disableThinking=thinking.equals("true")||(thinking.equals("auto")&&uri!=null&&"api.deepseek.com".equalsIgnoreCase(uri.getHost()));
+  }
+  /** 外部调用必须配置密钥；本地服务可免密。 */
+  public boolean configured(){return enabled&&!endpoint.isBlank()&&!model.isBlank()&&(local||!key.isBlank());}
   /** 一次请求最多三段公开证据，超时、截断及协议异常均退回原文，不返回供应商错误正文。 */
   public Answer answer(String question,List<Evidence> evidence)throws Exception{
     if(!configured())throw new IllegalStateException("GENERATION_NOT_CONFIGURED");if(evidence.isEmpty()||evidence.size()>3)throw new IllegalArgumentException("证据数量无效");

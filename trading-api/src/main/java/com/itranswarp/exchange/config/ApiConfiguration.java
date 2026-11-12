@@ -16,11 +16,15 @@ public class ApiConfiguration {
   @Bean
   com.itranswarp.exchange.service.assistant.AiModelClient assistantModel(
       @Value("${SEC_ASSISTANT_EXTERNAL_ENABLED:false}") boolean enabled,
+      @Value("${SEC_ASSISTANT_PROVIDER:external}") String provider,
       @Value("${SEC_ASSISTANT_ENDPOINT:}") String endpoint,
       @Value("${SEC_ASSISTANT_MODEL:}") String model,
       @Value("${SEC_ASSISTANT_API_KEY:}") String key,
       @Value("${SEC_ASSISTANT_DISABLE_THINKING:auto}") String thinking) {
     if(!java.util.Set.of("auto","true","false").contains(thinking))throw new IllegalArgumentException("思考配置只能为auto、true或false");
+    boolean local="local".equalsIgnoreCase(provider);
+    if(local)return new com.itranswarp.exchange.service.assistant.HttpAiModelClient(true,endpoint,model,key,"true".equals(thinking),true);
+    enabled=enabled&&"external".equalsIgnoreCase(provider);
     if(thinking.equals("auto"))return new com.itranswarp.exchange.service.assistant.HttpAiModelClient(enabled,endpoint,model,key);
     return new com.itranswarp.exchange.service.assistant.HttpAiModelClient(enabled,endpoint,model,key,Boolean.parseBoolean(thinking));
   }
@@ -39,21 +43,39 @@ public class ApiConfiguration {
   /** 文档只加载白名单资源，构造不连接RAG依赖。 */
   @Bean
   com.itranswarp.exchange.service.assistant.rag.KnowledgeDocumentService knowledgeDocuments(DepositService deposits){return new com.itranswarp.exchange.service.assistant.rag.KnowledgeDocumentService(deposits.policy());}
-  /** CPU嵌入与Chroma在回环端口，地址经Config Server配置，不由用户问题指定。 */
+  /** 默认使用本机 BGE；外部模式读取独立的 HTTPS 端点和密钥，不由用户问题指定。 */
   @Bean
-  com.itranswarp.exchange.service.assistant.rag.EmbeddingClient embeddings(@Value("${securities.assistant.rag.embedding-url:http://127.0.0.1:18081}")String url){return new com.itranswarp.exchange.service.assistant.rag.HttpEmbeddingClient(url);}
+  com.itranswarp.exchange.service.assistant.rag.EmbeddingClient embeddings(
+      @Value("${SEC_RAG_EMBEDDING_PROVIDER:local}") String provider,
+      @Value("${securities.assistant.rag.embedding-url:http://127.0.0.1:18081}") String url,
+      @Value("${SEC_RAG_EMBEDDING_ENDPOINT:}") String endpoint,
+      @Value("${SEC_RAG_EMBEDDING_MODEL:}") String model,
+      @Value("${SEC_RAG_EMBEDDING_API_KEY:}") String key,
+      @Value("${SEC_RAG_EMBEDDING_REVISION:1}") String revision) {
+    if ("local".equalsIgnoreCase(provider)) return new com.itranswarp.exchange.service.assistant.rag.HttpEmbeddingClient(url);
+    // 拼错提供方也不回退到另一个模型；留给知识索引后台降级，交易仍可启动。
+    return new com.itranswarp.exchange.service.assistant.rag.ExternalEmbeddingClient(
+        "external".equalsIgnoreCase(provider) ? endpoint : "", model, key, revision);
+  }
   /** 向量库只保存公开知识索引，不参与交易数据库事务。 */
   @Bean
   com.itranswarp.exchange.repository.ChromaKnowledgeRepository knowledgeVectors(@Value("${securities.assistant.rag.chroma-url:http://127.0.0.1:18080}")String url){return new com.itranswarp.exchange.repository.ChromaKnowledgeRepository(url);}
   /** 后台建库的失败不能导致API和交易启动失败；关闭时仅停止自己的线程。 */
   @Bean(initMethod="start",destroyMethod="close")
   com.itranswarp.exchange.service.assistant.rag.KnowledgeIndexService knowledgeIndex(@Value("${securities.assistant.rag.enabled:true}")boolean enabled,com.itranswarp.exchange.service.assistant.rag.KnowledgeDocumentService documents,com.itranswarp.exchange.service.assistant.rag.EmbeddingClient embedding,com.itranswarp.exchange.repository.ChromaKnowledgeRepository vectors){return new com.itranswarp.exchange.service.assistant.rag.KnowledgeIndexService(enabled,documents,embedding,vectors);}
-  /** 生成独立预算，默认沿用已显式开启的聊天配置，可单独关闭且不影响分类。 */
+  /** 生成默认跟随所选聊天模式，可独立关闭且不影响分类。 */
   @Bean
   com.itranswarp.exchange.service.assistant.rag.KnowledgeAnswerClient knowledgeAnswer(
-      @Value("${SEC_RAG_GENERATION_ENABLED:${SEC_ASSISTANT_EXTERNAL_ENABLED:false}}")boolean enabled,
+      @Value("${SEC_RAG_GENERATION_ENABLED:}")String generation,
+      @Value("${SEC_ASSISTANT_EXTERNAL_ENABLED:false}")boolean externalEnabled,
+      @Value("${SEC_ASSISTANT_PROVIDER:external}")String provider,
       @Value("${SEC_ASSISTANT_ENDPOINT:}")String endpoint,@Value("${SEC_ASSISTANT_MODEL:}")String model,
-      @Value("${SEC_ASSISTANT_API_KEY:}")String key,@Value("${SEC_ASSISTANT_DISABLE_THINKING:auto}")String thinking){return new com.itranswarp.exchange.service.assistant.rag.HttpKnowledgeAnswerClient(enabled,endpoint,model,key,thinking);}
+      @Value("${SEC_ASSISTANT_API_KEY:}")String key,@Value("${SEC_ASSISTANT_DISABLE_THINKING:auto}")String thinking){
+    boolean local="local".equalsIgnoreCase(provider);
+    boolean active=local||("external".equalsIgnoreCase(provider)&&externalEnabled);
+    return new com.itranswarp.exchange.service.assistant.rag.HttpKnowledgeAnswerClient(
+        active&&(generation.isBlank()||Boolean.parseBoolean(generation)),endpoint,model,key,thinking,local);
+  }
   /** 原文、向量召回与生成按职责装配；配置关闭时不调用嵌入或生成。 */
   @Bean
   com.itranswarp.exchange.service.assistant.AssistantKnowledgeService knowledgeService(
