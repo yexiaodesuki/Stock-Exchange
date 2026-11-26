@@ -208,7 +208,9 @@ Stock-Exchange/
 ## 进一步阅读
 
 - [运行与联调](docs/running.md)：IDEA 启动、端口、容器和隔离验证步骤。
-- [验收记录](docs/verification.md)：交易、恢复和集成验证范围；普通 Maven 测试不等于完整联调。
+- [当前版本验收](docs/current-acceptance.md)：CI、离线回归与隔离联调入口，区分通过、跳过和未验收。
+- [性能基线](docs/performance.md)：单线程撮合与两种恢复路径的可复跑实测，不代表端到端容量。
+- [历史验收记录](docs/verification.md)：五容器阶段的验证记录。
 - [网关](docs/nginx.md) · [模拟入金](docs/deposits.md) · [演示账户](docs/demo-users.md) · [RAG 实现](docs/rag-implementation.md)。
 
 当前配置面向本地开发和演示，默认使用本地 HTTP，不是公网部署方案，也不提供生产级资金安全、高可用或模型回答正确性保证。

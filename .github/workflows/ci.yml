@@ -1,0 +1,31 @@
+# 无密钥回归，仅测试本次提交，不启动外部服务。
+name: CI
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  baseline:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify revision
+        shell: pwsh
+        run: ./build/securities/verify-current.ps1
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-windows
+          path: '**/target/surefire-reports/TEST-*.xml'
+          if-no-files-found: warn
