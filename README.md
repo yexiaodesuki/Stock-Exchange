@@ -214,3 +214,9 @@ Stock-Exchange/
 - [网关](docs/nginx.md) · [模拟入金](docs/deposits.md) · [演示账户](docs/demo-users.md) · [RAG 实现](docs/rag-implementation.md)。
 
 当前配置面向本地开发和演示，默认使用本地 HTTP，不是公网部署方案，也不提供生产级资金安全、高可用或模型回答正确性保证。
+
+## 许可证与来源
+
+本项目基于廖雪峰的 [WarpExchange](https://github.com/michaelliao/warpexchange) 演进，沿用 [GNU General Public License v3.0（GPL-3.0）](LICENSE)。上游代码的原有版权与许可声明应予保留；第三方依赖和资源适用各自的许可证。
+
+本仓库在上游基础上扩展了多证券交易、模拟入金、快照与故障恢复、监控、只读 AI 助手，以及自动化验收和性能基线。再分发本项目或其修改版时，请遵守许可证正文，包括保留相关声明、标明修改，以及在分发二进制时按许可证规定提供相应源码。
